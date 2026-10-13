@@ -24,15 +24,14 @@ function abortedError() {
 
 // Fingerprint headers the upstream free-tier gateway requires on every request.
 //
-// We prefer the *real* fingerprint obtained by running the actual `opencode` CLI
-// (see src/fingerprint.js): its User-Agent and, crucially, its x-opencode-session
-// id are validated server-side and cannot be safely faked. The `fp` argument is
-// the (awaited) real fingerprint header set; when null we fall back to the static
-// shape kept in sync with fingerprint.js FALLBACK_FP_HEADERS.
+// The fingerprint is generated in pure JS (see src/fingerprint.js) — no CLI or
+// MITM. `fp` is the (awaited) fingerprint header set; when null we fall back to
+// the synchronous peek. Both carry only the shape the upstream gate validates.
 function fingerprintHeaders(fp) {
   const real = fp || peekFingerprintHeaders()
-  // Real fingerprint header keys are lower-cased (e.g. `authorization`); we strip
-  // any existing authorization so our resolved key (capitalized) is the only one.
+  // The generator emits lower-cased keys (no authorization); strip any
+  // authorization that may have been merged in so our resolved key is the only
+  // one, then add the resolved `Authorization`.
   const { authorization: _drop, ...rest } = real
   void _drop
   return {

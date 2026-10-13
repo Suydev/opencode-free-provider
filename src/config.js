@@ -7,73 +7,52 @@ export const LITERAL_KEY = 'public'
 export const getOpencodeBase = () =>
   process.env.OPENCODE_BASE_OVERRIDE || 'https://opencode.ai/zen/v1'
 
-// --- Dynamic client fingerprint -------------------------------------------
-// The free-tier gateway validates the User-Agent and the x-opencode-session id
-// shape/checksum, and it changes across OpenCode releases. Rather than hard-code
-// a fingerprint that will bit-rot, we obtain a *real* one by running the actual
-// `opencode` CLI through a local MITM proxy (see src/fingerprint.js). The result
-// is cached for OPENCODE_FP_TTL_MS (default 30 min) and refreshed on demand.
+// --- Client fingerprint ----------------------------------------------------
+// The free-tier gateway validates the User-Agent and the x-opencode-session id.
+// The session id is NOT checksummed: it is opencode's ordinary descending
+// identifier, whose structure (and low-12-bit counter bound) we reproduce in
+// pure JS — see src/fingerprint.js for the full derivation. No CLI, no MITM.
 //
-// Exported constants below are the FALLBACK values used only if the CLI cannot
-// be spawned (no opencode installed, sandbox blocks network, …). They mirror a
-// known-good opencode 2.x fingerprint so the proxy still boots.
-import { getFingerprint, fingerprintState } from './fingerprint.js'
+// config.js re-exports the fingerprint API so the rest of the code keeps
+// importing it from here (single source of truth = src/fingerprint.js).
+import {
+  getFingerprintHeaders,
+  peekFingerprintHeaders,
+  buildFingerprintHeaders,
+  fingerprintState,
+  newSessionId,
+  newMessageId,
+  newRequestId,
+  currentSession,
+  sessionState,
+  encodeIdentifier,
+  OPENCODE_UA,
+  OPENCODE_CLIENT,
+  OPENCODE_PROJECT,
+  FALLBACK_FP_HEADERS,
+  MAX_COUNTER,
+} from './fingerprint.js'
 
-let _fpPromise = null
-function fingerprintNow() {
-  // cache the in-flight promise so concurrent requests share one capture
-  if (!_fpPromise) {
-    _fpPromise = getFingerprint().finally(() => { _fpPromise = null })
-  }
-  return _fpPromise
+export {
+  getFingerprintHeaders,
+  peekFingerprintHeaders,
+  buildFingerprintHeaders,
+  fingerprintState,
+  newSessionId,
+  newMessageId,
+  newRequestId,
+  currentSession,
+  sessionState,
+  encodeIdentifier,
+  OPENCODE_UA,
+  OPENCODE_CLIENT,
+  OPENCODE_PROJECT,
+  FALLBACK_FP_HEADERS,
+  MAX_COUNTER,
 }
 
-// Returns the real OpenCode fingerprint headers for the current upstream call.
-// `fallback` carries the static values used by the rest of config.js constants.
-export async function getFingerprintHeaders() {
-  const fp = await fingerprintNow()
-  return fp.headers
-}
-
-// Synchronous access to the cached fingerprint (may be the fallback on cold
-// start). Used where an async call is inconvenient; callers should still prefer
-// getFingerprintHeaders() for the freshest real fingerprint.
-export function peekFingerprintHeaders() {
-  // Best-effort: trigger a refresh if absent, but do not block.
-  if (!_fpPromise) {
-    fingerprintNow().catch(() => {})
-  }
-  // Fallback constants are defined below and returned if the cache is empty.
-  return FALLBACK_FP_HEADERS
-}
-
-// Static fallback (kept in sync with fingerprint.js FALLBACK_FP). These are used
-// until the first real fingerprint is captured.
-export const FALLBACK_FP_HEADERS = {
-  'content-type': 'application/json',
-  authorization: 'Bearer public',
-  'user-agent': 'opencode/latest/2.0.22/cli',
-  'x-opencode-client': 'cli',
-  'x-opencode-project': 'global',
-  'x-opencode-session': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-  'x-opencode-session-id': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-  'x-session-affinity': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-  'x-session-id': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-}
-
-// Mimic the official opencode client UA. The free-tier gateway rejects anything
-// that is not an `opencode/<version>` UA. The version string MUST start with a
-// lowercase `opencode/`. We prefer the *real* UA obtained from the CLI; this
-// constant is only the fallback shape.
-export const OPENCODE_UA = FALLBACK_FP_HEADERS['user-agent']
-
-// Extra fingerprint headers the upstream free-tier gateway requires. The real
-// values are obtained dynamically from the opencode CLI (see getFingerprintHeaders
-// / src/fingerprint.js). These constants are only the fallback shape used when the
-// CLI cannot be spawned. NOTE: the session id shape is validated server-side, so
-// the random-hex generators below are likewise fallbacks only.
-export const OPENCODE_CLIENT = 'cli'
-export const OPENCODE_PROJECT = 'global'
+// session mode knobs (re-exported for /__session and tests)
+export { ZEN_SESSION_MODE, ZEN_SESSION_ROTATE_SECONDS } from './fingerprint.js'
 
 // Default provider name advertised by /v1/models (OpenAI-style id === "provider/model").
 export const PROVIDER = 'opencode-free'
@@ -83,65 +62,6 @@ export const DEFAULT_HOST = '127.0.0.1'
 export const DEFAULT_MAX_TOKENS = 128000
 export const DEFAULT_CONTEXT_WINDOW = 200000
 export const MAX_REQUEST_ATTEMPTS = 2
-
-// ---------------------------------------------------------------------------
-// Session / request fingerprint generation
-// ---------------------------------------------------------------------------
-// The upstream free tier only accepts `x-opencode-session` values of the form
-//   ses_ + 12 hex chars + 14 hex chars   (26 chars total)
-// UUID-formatted values are rejected (403). We generate exactly that shape.
-import crypto from 'node:crypto'
-
-// session mode: 'per-request' (fresh ses_ every call, default & safest) or
-// 'sticky' (one session reused for the whole process; optional rotation).
-// Mirrors the reference zen_relay.py knobs.
-export const ZEN_SESSION_MODE =
-  process.env.ZEN_SESSION_MODE === 'sticky' ? 'sticky' : 'per-request'
-export const ZEN_SESSION_ROTATE_SECONDS = Number(process.env.ZEN_SESSION_ROTATE_SECONDS) || 0
-
-function randomHex(n) {
-  return crypto.randomBytes(Math.ceil(n / 2)).toString('hex').slice(0, n)
-}
-
-export function newSessionId() {
-  // ses_ + 12 hex + 14 hex == 26 chars (matches upstream expectation)
-  return `ses_${randomHex(12)}${randomHex(14)}`
-}
-
-export function newRequestId() {
-  return `msg_${randomHex(12)}${randomHex(14).toUpperCase()}`
-}
-
-// Process-wide sticky session state (only used when ZEN_SESSION_MODE === 'sticky').
-let _stickySession = null
-let _stickyBorn = 0
-let _rotations = 0
-
-export function currentSession() {
-  if (ZEN_SESSION_MODE !== 'sticky') return newSessionId()
-  const now = Date.now()
-  if (!_stickySession) {
-    _stickySession = newSessionId()
-    _stickyBorn = now
-    return _stickySession
-  }
-  if (ZEN_SESSION_ROTATE_SECONDS > 0 && (now - _stickyBorn) / 1000 >= ZEN_SESSION_ROTATE_SECONDS) {
-    _stickySession = newSessionId()
-    _stickyBorn = now
-    _rotations += 1
-  }
-  return _stickySession
-}
-
-export function sessionState() {
-  return {
-    mode: ZEN_SESSION_MODE,
-    session: ZEN_SESSION_MODE === 'sticky' ? _stickySession : null,
-    rotateSeconds: ZEN_SESSION_ROTATE_SECONDS || null,
-    rotations: ZEN_SESSION_MODE === 'sticky' ? _rotations : 0,
-    uptimeSeconds: null,
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Mandatory tool "fingerprint"

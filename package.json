@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "OPENCODE_FP_DISABLE=1 node --test test/*.test.js"
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"

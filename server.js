@@ -15,9 +15,10 @@
 //   model:   opencode-free/big-pickle
 //
 // The upstream free tier enforces a client-fingerprint gate (User-Agent must be
-// opencode/>=1.18, a valid x-opencode-session, and the request body must include
-// the four agent tools bash/glob/grep/read). This proxy injects all of that for
-// you, so any OpenAI-compatible client just points at the local endpoint.
+// opencode/>=1.18, a valid x-opencode-session id, and the request body must
+// include the four agent tools bash/glob/grep/read). This proxy generates that
+// fingerprint in pure JS (src/fingerprint.js) and injects it for you, so any
+// OpenAI-compatible client just points at the local endpoint.
 
 import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
@@ -101,13 +102,14 @@ function start() {
   server.listen(PORT, HOST, () => {
     console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1`)
     console.log(`[opencode-free-provider] relaying to OpenCode Zen free tier (Bearer public)`)
-    // Warm up the real opencode fingerprint in the background so the first
-    // chat request doesn't pay the spawn/MITM capture cost.
+    // Log the generated fingerprint so the first chat request is predictable.
+    // Generation is pure JS and synchronous, so there is no warm-up cost; this
+    // is purely informational.
     getFingerprintHeaders().then((h) => {
       const st = fingerprintState()
-      console.log(`[opencode-free-provider] fingerprint source: ${st.source} (session ${st.session})`)
+      console.log(`[opencode-free-provider] fingerprint source: ${st.source} (user-agent ${h['user-agent']}, session ${h['x-opencode-session']})`)
     }).catch((e) => {
-      console.warn(`[opencode-free-provider] fingerprint warm-up failed, using fallback: ${e && e.message}`)
+      console.warn(`[opencode-free-provider] fingerprint init failed: ${e && e.message}`)
     })
   })
 }

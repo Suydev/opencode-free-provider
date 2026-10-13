@@ -1,284 +1,224 @@
 // src/fingerprint.js
 //
-// Dynamic OpenCode fingerprint generator.
+// Pure-JS OpenCode fingerprint generator — NO CLI, NO MITM, NO child_process.
 //
 // WHY THIS EXISTS
 // ---------------
 // OpenCode's free tier (opencode.ai/zen/v1) enforces a client-fingerprint gate.
+// A bare request is rejected with:
+//
+//   403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
+//
 // The gate requires:
-//   - User-Agent  : `opencode/<ver>/<cli|...>`
-//   - x-opencode-session : a session id of a SPECIFIC, non-trivial shape.
-//     It looks like `ses_` + 26 chars of mixed-case alphanumerics. It is NOT a
-//     simple random hex string — the server validates its structure/checksum,
-//     so it CANNOT be faked by the proxy. The only reliable source of a valid
-//     id is the real `opencode` binary itself.
+//   - `User-Agent`          : `opencode/<version>`, version >= 1.18 (older → 426)
+//   - `x-opencode-session`  : a session id in the exact shape opencode emits
+//   - body `stream:true`    : false → 403
+//   - body `tools`          : must contain bash/glob/grep/read (exactly once each)
 //
-// This module therefore spawns the real `opencode` CLI, points it at a local
-// MITM proxy via HTTPS_PROXY, and intercepts the chat/completions request
-// opencode makes. The real fingerprint headers (User-Agent, x-opencode-session,
-// x-opencode-session-id, x-opencode-client, x-opencode-project, …) are captured
-// and cached for reuse.
+// HOW THE SESSION ID IS VALIDATED (reverse-engineered 2026-04, live ablation)
+// -------------------------------------------------------------------------
+// opencode mints session ids with `SessionID.create()`:
 //
-// USAGE
-// -----
-//   import { getFingerprint } from './fingerprint.js'
-//   const fp = await getFingerprint()   // → { headers: {...}, session, source }
-//   // fp.headers is merged into every upstream request.
+//     "ses_" + descending()
 //
-// Fallbacks: if `opencode` cannot be spawned (not installed, network sandbox),
-// or OpenSSL/TLS interception fails, the module falls back to a static,
-// last-known-good capture so the proxy still boots. Set
-// OPENCODE_FP_DISABLE=1 to skip spawning entirely.
-
-import http from 'node:http'
-import net from 'node:net'
-import tls from 'node:tls'
-import { spawn, execFileSync } from 'node:child_process'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
-
-const ZEN_HOST = 'opencode.ai'
-const MODELS_HOST = 'models.opencode.ai'
-const CAPTURE_TIMEOUT_MS = Number(process.env.OPENCODE_FP_TIMEOUT_MS) || 15000
-const CACHE_TTL_MS = Number(process.env.OPENCODE_FP_TTL_MS) || 30 * 60 * 1000 // 30 min
-
-// ---------------------------------------------------------------------------
-// Self-signed CA for the MITM proxy. Generated once (in-memory, on disk
-// temporarily). The spawned opencode runs with NODE_TLS_REJECT_UNAUTHORIZED=0
-// so it trusts our cert. (opencode is a Bun binary; this env var is honored by
-// its fetch.) We mint the CA with OpenSSL, present on any box with opencode.
-// ---------------------------------------------------------------------------
-function generateCa() {
-  try {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ocfp-'))
-    const keyPath = path.join(tmp, 'ca.key')
-    const crtPath = path.join(tmp, 'ca.crt')
-    execFileSync('openssl', [
-      'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
-      '-keyout', keyPath, '-out', crtPath, '-days', '2',
-      '-subj', '/CN=opencode-fp-mitm',
-    ], { stdio: 'ignore', timeout: 8000 })
-    if (fs.existsSync(keyPath) && fs.existsSync(crtPath)) {
-      return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(crtPath), tmp }
-    }
-  } catch { /* fall through */ }
-  return null
-}
-
-// ---------------------------------------------------------------------------
-// MITM proxy. For CONNECT to opencode.ai we terminate TLS with our CA cert,
-// sniff the plaintext request to capture the real fingerprint headers, and
-// faithfully relay the bytes (headers + body) to the real server so opencode's
-// own request completes (and so the captured session id is the genuine one).
+// and `descending()` (packages/schema/src/identifier.ts) is:
 //
-// The relay is byte-faithful: the first client→server chunk is parsed for
-// headers only after a copy has been queued to the real upstream; subsequent
-// body chunks are forwarded verbatim. This avoids dropping body bytes when the
-// header block and body arrive in separate TLS records (the bug that produced
-// unusable session ids before).
+//     counter++                       // per-millisecond counter, resets each ms
+//     current = BigInt(Date.now()) * 0x1000n + BigInt(counter)
+//     value   = ~current              // 48-bit two's complement
+//     hex     = 6 bytes of `value`    // == 12 lowercase hex chars
+//     tail    = 14 random base62 chars (charset 0-9A-Za-z)
 //
-// Returns { server, port, captureState }. captureState.captured becomes true
-// once the fingerprint is intercepted.
-// ---------------------------------------------------------------------------
-function startMitm(ca, onCapture) {
-  const captureState = { captured: false }
-  return new Promise((resolve) => {
-    const server = http.createServer()
-    server.on('connect', (req, clientSocket, head) => {
-      const [host, portStr] = (req.url || '').split(':')
-      const port = Number(portStr) || 443
-      const isZen = host.includes(ZEN_HOST) || host.includes(MODELS_HOST)
-      if (!isZen) {
-        // transparent passthrough (e.g. localhost standalone server)
-        const s = net.connect(port, host, () => {
-          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-          if (head.length) s.write(head)
-          s.pipe(clientSocket)
-          clientSocket.pipe(s)
-        })
-        s.on('error', () => clientSocket.destroy())
-        clientSocket.on('error', () => s.destroy())
-        return
-      }
-      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-      const ctls = new tls.TLSSocket(clientSocket, {
-        isServer: true,
-        SNICallback: (sni, cb) => cb(null, tls.createSecureContext({ key: ca.key, cert: ca.cert })),
-      })
-      let real = null
-      let captured = false
-      ctls.on('data', (clear) => {
-        // Forward everything to the real server; create the upstream tunnel
-        // lazily on the first chunk.
-        if (!real) {
-          real = tls.connect(port, host, { servername: host }, () => real.write(clear))
-          real.on('data', (d) => ctls.write(d))
-          real.on('error', () => clientSocket.destroy())
-          real.on('close', () => ctls.end())
-        } else {
-          real.write(clear)
-        }
-        if (!captured) {
-          const txt = clear.toString('latin1')
-          const i = txt.indexOf('\r\n\r\n')
-          if (i < 0) return // header block not complete yet; body will arrive later
-          const headStr = txt.slice(0, i)
-          const parts = headStr.split('\r\n')
-          const [method, p] = parts[0].split(' ')
-          const hdrs = {}
-          parts.slice(1).forEach((l) => {
-            const c = l.indexOf(':')
-            if (c > 0) hdrs[l.slice(0, c).toLowerCase()] = l.slice(c + 1).trim()
-          })
-          if (p && p.includes('/zen/v1/chat/completions')) {
-            captured = true
-            captureState.captured = true
-            onCapture({ method, path: p, headers: hdrs })
-          }
-        }
-      })
-      ctls.on('error', () => clientSocket.destroy())
-    })
-    server.on('error', () => { /* ignore */ })
-    server.listen(0, '127.0.0.1', () => {
-      const addr = server.address()
-      resolve({ server, port: addr.port, captureState })
-    })
-  })
-}
+// so a real id is `ses_` + 12 lowercase hex + 14 base62 (30 chars total).
+//
+// The server does NOT verify a cryptographic checksum. It validates the *shape*
+// and, decisively, the low 12 bits of the 48-bit hex value — which is the
+// counter field of `~(ts * 0x1000 + counter)`, i.e.
+//
+//     low12 = 0xfff - counter
+//
+// Live ablation pinned the rule to: **counter must be <= 63** (low12 >= 0xfc0).
+// counter 0..63 → 200; counter 64..4095 → 403. Everything else (timestamp
+// magnitude/recency, the higher 36 bits, and the 14-char tail's charset) is NOT
+// validated: only the tail *length* (exactly 14) and the first 12 chars being
+// lowercase hex matter. Emitting opencode's real algorithm with
+// `Date.now()` and a small counter therefore always passes.
+//
+// This means the fingerprint is fully reproducible in pure JavaScript and the
+// proxy no longer needs to install or spawn the real `opencode` binary.
+
+import { randomBytes } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
-// Spawn opencode; it will (via HTTPS_PROXY) send its real zen request through
-// our MITM. We resolve as soon as the fingerprint is captured.
+// Identifier generation (mirrors opencode's packages/schema/src/identifier.ts)
 // ---------------------------------------------------------------------------
-async function captureFromOpencode(proxyPort, captureState) {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocfp-cfg-'))
-  // Clone env, then force opencode's traffic through our MITM and neutralize any
-  // other proxy vars that could divert the request away from it.
-  const env = { ...process.env }
-  delete env.ALL_PROXY
-  delete env.all_proxy
-  delete env.NODE_EXTRA_CA_CERTS
-  env.OPENCODE_CONFIG_DIR = tmpDir
-  env.HOME = tmpDir
-  env.OPENCODE_API_KEY = ''
-  env.HTTPS_PROXY = `http://127.0.0.1:${proxyPort}`
-  env.HTTP_PROXY = `http://127.0.0.1:${proxyPort}`
-  env.NO_PROXY = '127.0.0.1,localhost'
-  env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
-  const proc = spawn('opencode', ['run', 'say hi', '--standalone', '-m', 'opencode/big-pickle'], {
-    env,
-    stdio: ['ignore', 'ignore', 'ignore'],
-  })
-  const ok = await new Promise((resolve) => {
-    const iv = setInterval(() => { if (captureState.captured) { clearInterval(iv); resolve(true) } }, 50)
-    setTimeout(() => { clearInterval(iv); resolve(false) }, CAPTURE_TIMEOUT_MS)
-  })
-  try { proc.kill('SIGKILL') } catch { /* ignore */ }
-  fs.rmSync(tmpDir, { recursive: true, force: true })
-  return ok
-}
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-let _cache = null
-let _cacheAt = 0
+const CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const TAIL_LENGTH = 14 // == opencode's `length (26) - 12`
+const MASK_48 = (1n << 48n) - 1n
+const COUNTER_SPAN = 0x1000n // opencode packs the counter into the low 12 bits
 
-// Last-known-good fingerprint (captured from opencode v2.0.22). Used as a
-// fallback when the live `opencode` command cannot be spawned. The session id
-// here is a real one emitted by opencode; if the server later rejects it, the
-// operator can force a refresh (OPENCODE_FP_DISABLE unset + fresh process, or
-// call getFingerprint({ force: true }) from a context where opencode works).
-const FALLBACK_FP = {
-  headers: {
-    'content-type': 'application/json',
-    authorization: 'Bearer public',
-    'user-agent': 'opencode/latest/2.0.22/cli',
-    'x-opencode-client': 'cli',
-    'x-opencode-project': 'global',
-    'x-opencode-session': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-    'x-opencode-session-id': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-    'x-session-affinity': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-    'x-session-id': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-  },
-  session: 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
-  source: 'fallback',
-}
+// The largest counter the free-tier gate accepts: counter <= 63 (low12 >= 0xfc0).
+export const MAX_COUNTER = 63
 
-function buildFingerprintFromHeaders(h) {
-  const session = h['x-opencode-session'] || h['x-session-id'] || ''
-  return {
-    headers: {
-      'content-type': 'application/json',
-      authorization: 'Bearer public',
-      'user-agent': h['user-agent'],
-      'x-opencode-client': h['x-opencode-client'] || 'cli',
-      'x-opencode-project': h['x-opencode-project'] || 'global',
-      'x-opencode-session': session,
-      'x-opencode-session-id': h['x-opencode-session-id'] || session,
-      'x-session-affinity': h['x-session-affinity'] || session,
-      'x-session-id': h['x-session-id'] || session,
-    },
-    session,
-    source: 'opencode-cli',
-  }
+let lastTimestamp = 0
+let counter = 0
+
+function randomBase62(n) {
+  const bytes = randomBytes(n)
+  let out = ''
+  for (let i = 0; i < n; i++) out += CHARS[bytes[i] % 62]
+  return out
 }
 
 /**
- * Return a fresh, real OpenCode fingerprint ({ headers, session, source }).
- * Results are cached for OPENCODE_FP_TTL_MS. Spawning opencode can be disabled
- * with OPENCODE_FP_DISABLE=1 (forces fallback).
+ * Encode an identifier exactly like opencode's `ascending()`/`descending()`.
+ * Returns 12 lowercase hex chars + 14 base62 chars (26 chars, no prefix).
+ *
+ * `counter` is shared across ascending/descending calls, matching opencode. If
+ * more than MAX_COUNTER ids are minted within one millisecond we roll over to
+ * the next millisecond rather than emit a counter the gate would reject.
  */
-export async function getFingerprint({ force = false } = {}) {
+export function encodeIdentifier(timestamp = Date.now(), { descending = true } = {}) {
+  if (timestamp !== lastTimestamp) {
+    lastTimestamp = timestamp
+    counter = 0
+  }
+  counter++
+  if (counter > MAX_COUNTER) {
+    lastTimestamp += 1
+    counter = 1
+  }
+  const current = BigInt(lastTimestamp) * COUNTER_SPAN + BigInt(counter)
+  const value = (descending ? ~current : current) & MASK_48
+  return value.toString(16).padStart(12, '0') + randomBase62(TAIL_LENGTH)
+}
+
+/** A fresh `ses_…` session id (descending, like opencode's SessionID.create()). */
+export function newSessionId() {
+  return `ses_${encodeIdentifier(Date.now(), { descending: true })}`
+}
+
+/** A fresh `msg_…` message id (ascending, like opencode's SessionMessage.ID.create()). */
+export function newMessageId() {
+  return `msg_${encodeIdentifier(Date.now(), { descending: false })}`
+}
+
+/** Back-compat alias: the id sent as `x-opencode-request`. */
+export function newRequestId() {
+  return newMessageId()
+}
+
+// ---------------------------------------------------------------------------
+// Session mode (per-request vs sticky)
+// ---------------------------------------------------------------------------
+// 'per-request' (default, safest): a fresh ses_ id on every upstream call.
+// 'sticky': one session reused for the whole process (optionally rotated).
+export const ZEN_SESSION_MODE =
+  process.env.ZEN_SESSION_MODE === 'sticky' ? 'sticky' : 'per-request'
+export const ZEN_SESSION_ROTATE_SECONDS = Number(process.env.ZEN_SESSION_ROTATE_SECONDS) || 0
+
+let _stickySession = null
+let _stickyBorn = 0
+let _rotations = 0
+
+export function currentSession() {
+  if (ZEN_SESSION_MODE !== 'sticky') return newSessionId()
   const now = Date.now()
-  if (!force && _cache && now - _cacheAt < CACHE_TTL_MS) return _cache
-
-  if (process.env.OPENCODE_FP_DISABLE === '1') {
-    _cache = { ...FALLBACK_FP, source: 'fallback-disabled' }
-    _cacheAt = now
-    return _cache
+  if (!_stickySession) {
+    _stickySession = newSessionId()
+    _stickyBorn = now
+    return _stickySession
   }
-
-  const ca = generateCa()
-  if (!ca) {
-    // No openssl → cannot MITM → use fallback.
-    _cache = { ...FALLBACK_FP, source: 'fallback-no-ca' }
-    _cacheAt = now
-    return _cache
+  if (ZEN_SESSION_ROTATE_SECONDS > 0 && (now - _stickyBorn) / 1000 >= ZEN_SESSION_ROTATE_SECONDS) {
+    _stickySession = newSessionId()
+    _stickyBorn = now
+    _rotations += 1
   }
+  return _stickySession
+}
 
-  let mitm = null
-  try {
-    const { server, port, captureState } = await startMitm(ca, (cap) => {
-      _cache = buildFingerprintFromHeaders(cap.headers)
-      _cacheAt = Date.now()
-    })
-    mitm = server
-    const ok = await captureFromOpencode(port, captureState)
-    if (ok && _cache && _cache.source === 'opencode-cli') {
-      // success: _cache already set by the capture callback
-    } else {
-      _cache = { ...FALLBACK_FP, source: ok ? 'fallback-recapture' : 'fallback-spawn-failed' }
-      _cacheAt = now
-    }
-  } catch {
-    _cache = { ...FALLBACK_FP, source: 'fallback-exception' }
-    _cacheAt = now
-  } finally {
-    if (mitm) try { mitm.close() } catch { /* ignore */ }
-    try { if (ca.tmp) fs.rmSync(ca.tmp, { recursive: true, force: true }) } catch { /* ignore */ }
+export function sessionState() {
+  return {
+    mode: ZEN_SESSION_MODE,
+    session: ZEN_SESSION_MODE === 'sticky' ? _stickySession : null,
+    rotateSeconds: ZEN_SESSION_ROTATE_SECONDS || null,
+    rotations: ZEN_SESSION_MODE === 'sticky' ? _rotations : 0,
+    uptimeSeconds: null,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprint headers
+// ---------------------------------------------------------------------------
+
+// Mimic the official opencode client UA. The gate rejects anything that is not
+// an `opencode/<version>` UA, and requires version >= 1.18 (older → 426).
+// Override with OPENCODE_UA if upstream raises the floor.
+export const OPENCODE_UA = process.env.OPENCODE_UA || 'opencode/latest/2.0.22/cli'
+export const OPENCODE_CLIENT = 'cli'
+export const OPENCODE_PROJECT = 'global'
+
+/**
+ * Build a complete, gate-valid fingerprint header set.
+ *
+ * Emits the same header group the real opencode sends for its own provider
+ * (`opencode/*` models): user-agent, x-opencode-session, x-opencode-session-id,
+ * x-opencode-request, x-opencode-client, x-opencode-project. Note
+ * x-opencode-session-id MUST equal x-opencode-session when present (a mismatch
+ * → 403), which is exactly what opencode does.
+ *
+ * `authorization` is intentionally omitted here; src/upstream.js adds the
+ * resolved `Authorization` header so the literal key / env override is applied
+ * in one place.
+ */
+export function buildFingerprintHeaders(session = currentSession()) {
+  return {
+    'content-type': 'application/json',
+    'user-agent': OPENCODE_UA,
+    'x-opencode-session': session,
+    'x-opencode-session-id': session,
+    'x-opencode-request': newMessageId(),
+    'x-opencode-client': OPENCODE_CLIENT,
+    'x-opencode-project': OPENCODE_PROJECT,
+  }
+}
+
+// Static last-known-good shape (used only for /__session introspection and by
+// callers that need a synchronous header object before the first request).
+export const FALLBACK_FP_HEADERS = buildFingerprintHeaders()
+
+let _cache = null
+let _cacheAt = 0
+
+/** Return the current fingerprint ({ headers, session, source }). */
+export async function getFingerprint() {
+  const session = currentSession()
+  _cache = { headers: buildFingerprintHeaders(session), session, source: 'generated' }
+  _cacheAt = Date.now()
   return _cache
+}
+
+/** Synchronous fingerprint access (generation is pure and cheap). */
+export function peekFingerprint() {
+  return _cache || { headers: FALLBACK_FP_HEADERS, session: FALLBACK_FP_HEADERS['x-opencode-session'], source: 'generated' }
+}
+
+export async function getFingerprintHeaders() {
+  return (await getFingerprint()).headers
+}
+
+export function peekFingerprintHeaders() {
+  return peekFingerprint().headers
 }
 
 export function fingerprintState() {
   return {
     cached: !!_cache,
-    source: _cache?.source || null,
+    source: _cache?.source || 'generated',
     session: _cache?.session || null,
     ageMs: _cache ? Date.now() - _cacheAt : null,
-    ttlMs: CACHE_TTL_MS,
+    ttlMs: null,
+    mode: ZEN_SESSION_MODE,
   }
 }
