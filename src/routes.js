@@ -1,4 +1,5 @@
 import { PROVIDER, sessionState, ensureModels, refreshModels, modelsCacheState } from './config.js'
+import { fingerprintState } from './fingerprint.js'
 import { listModelsPayload, isValidModel, findModel, splitModelId } from './models.js'
 import { relayChatCompletions } from './upstream.js'
 
@@ -47,7 +48,7 @@ export async function handleModelsInfo(req, res, url) {
 // Local debug endpoint (never forwarded upstream). Reports the current
 // x-opencode-session mode/state so the operator can confirm the fingerprint.
 export function handleSessionInfo(req, res) {
-  return sendJson(res, 200, { provider: PROVIDER, ...sessionState() })
+  return sendJson(res, 200, { provider: PROVIDER, ...sessionState(), fingerprint: fingerprintState() })
 }
 
 export async function handleModel(req, res, id) {

@@ -7,15 +7,71 @@ export const LITERAL_KEY = 'public'
 export const getOpencodeBase = () =>
   process.env.OPENCODE_BASE_OVERRIDE || 'https://opencode.ai/zen/v1'
 
-// Mimic the official opencode client UA. The free-tier gateway rejects anything
-// that is not an `opencode/<version>` UA with version >= 1.18 (too-old UAs get
-// 426, non-opencode UAs get 403 FreeTierError). The version string MUST stay
-// >= 1.18 and start with a lowercase `opencode/`.
-export const OPENCODE_UA = 'opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14'
+// --- Dynamic client fingerprint -------------------------------------------
+// The free-tier gateway validates the User-Agent and the x-opencode-session id
+// shape/checksum, and it changes across OpenCode releases. Rather than hard-code
+// a fingerprint that will bit-rot, we obtain a *real* one by running the actual
+// `opencode` CLI through a local MITM proxy (see src/fingerprint.js). The result
+// is cached for OPENCODE_FP_TTL_MS (default 30 min) and refreshed on demand.
+//
+// Exported constants below are the FALLBACK values used only if the CLI cannot
+// be spawned (no opencode installed, sandbox blocks network, …). They mirror a
+// known-good opencode 2.x fingerprint so the proxy still boots.
+import { getFingerprint, fingerprintState } from './fingerprint.js'
 
-// Extra fingerprint headers the upstream free-tier gateway requires. Without a
-// valid `x-opencode-session` (ses_<12 hex><14 hex>) AND a body that contains
-// the four agent tools (bash/glob/grep/read) it returns 403 FreeTierError.
+let _fpPromise = null
+function fingerprintNow() {
+  // cache the in-flight promise so concurrent requests share one capture
+  if (!_fpPromise) {
+    _fpPromise = getFingerprint().finally(() => { _fpPromise = null })
+  }
+  return _fpPromise
+}
+
+// Returns the real OpenCode fingerprint headers for the current upstream call.
+// `fallback` carries the static values used by the rest of config.js constants.
+export async function getFingerprintHeaders() {
+  const fp = await fingerprintNow()
+  return fp.headers
+}
+
+// Synchronous access to the cached fingerprint (may be the fallback on cold
+// start). Used where an async call is inconvenient; callers should still prefer
+// getFingerprintHeaders() for the freshest real fingerprint.
+export function peekFingerprintHeaders() {
+  // Best-effort: trigger a refresh if absent, but do not block.
+  if (!_fpPromise) {
+    fingerprintNow().catch(() => {})
+  }
+  // Fallback constants are defined below and returned if the cache is empty.
+  return FALLBACK_FP_HEADERS
+}
+
+// Static fallback (kept in sync with fingerprint.js FALLBACK_FP). These are used
+// until the first real fingerprint is captured.
+export const FALLBACK_FP_HEADERS = {
+  'content-type': 'application/json',
+  authorization: 'Bearer public',
+  'user-agent': 'opencode/latest/2.0.22/cli',
+  'x-opencode-client': 'cli',
+  'x-opencode-project': 'global',
+  'x-opencode-session': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
+  'x-opencode-session-id': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
+  'x-session-affinity': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
+  'x-session-id': 'ses_ecc24eda9ffeOJLs4VeYcatc3g',
+}
+
+// Mimic the official opencode client UA. The free-tier gateway rejects anything
+// that is not an `opencode/<version>` UA. The version string MUST start with a
+// lowercase `opencode/`. We prefer the *real* UA obtained from the CLI; this
+// constant is only the fallback shape.
+export const OPENCODE_UA = FALLBACK_FP_HEADERS['user-agent']
+
+// Extra fingerprint headers the upstream free-tier gateway requires. The real
+// values are obtained dynamically from the opencode CLI (see getFingerprintHeaders
+// / src/fingerprint.js). These constants are only the fallback shape used when the
+// CLI cannot be spawned. NOTE: the session id shape is validated server-side, so
+// the random-hex generators below are likewise fallbacks only.
 export const OPENCODE_CLIENT = 'cli'
 export const OPENCODE_PROJECT = 'global'
 

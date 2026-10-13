@@ -21,6 +21,8 @@
 
 import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
+import { fingerprintState } from './src/fingerprint.js'
+import { getFingerprintHeaders } from './src/config.js'
 import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo } from './src/routes.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
@@ -99,6 +101,14 @@ function start() {
   server.listen(PORT, HOST, () => {
     console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1`)
     console.log(`[opencode-free-provider] relaying to OpenCode Zen free tier (Bearer public)`)
+    // Warm up the real opencode fingerprint in the background so the first
+    // chat request doesn't pay the spawn/MITM capture cost.
+    getFingerprintHeaders().then((h) => {
+      const st = fingerprintState()
+      console.log(`[opencode-free-provider] fingerprint source: ${st.source} (session ${st.session})`)
+    }).catch((e) => {
+      console.warn(`[opencode-free-provider] fingerprint warm-up failed, using fallback: ${e && e.message}`)
+    })
   })
 }
 

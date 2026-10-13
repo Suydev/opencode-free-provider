@@ -1,7 +1,6 @@
 import {
-  getOpencodeBase, OPENCODE_UA, OPENCODE_CLIENT, OPENCODE_PROJECT,
-  LITERAL_KEY, DEFAULT_MAX_TOKENS, MAX_REQUEST_ATTEMPTS,
-  currentSession, newRequestId, isFingerprintTool,
+  getOpencodeBase, OPENCODE_UA, LITERAL_KEY, DEFAULT_MAX_TOKENS, MAX_REQUEST_ATTEMPTS,
+  isFingerprintTool, getFingerprintHeaders, peekFingerprintHeaders,
 } from './config.js'
 import {
   buildRequestBody, buildWireBody, parseSse, translateStream,
@@ -24,15 +23,21 @@ function abortedError() {
 }
 
 // Fingerprint headers the upstream free-tier gateway requires on every request.
-function fingerprintHeaders() {
+//
+// We prefer the *real* fingerprint obtained by running the actual `opencode` CLI
+// (see src/fingerprint.js): its User-Agent and, crucially, its x-opencode-session
+// id are validated server-side and cannot be safely faked. The `fp` argument is
+// the (awaited) real fingerprint header set; when null we fall back to the static
+// shape kept in sync with fingerprint.js FALLBACK_FP_HEADERS.
+function fingerprintHeaders(fp) {
+  const real = fp || peekFingerprintHeaders()
+  // Real fingerprint header keys are lower-cased (e.g. `authorization`); we strip
+  // any existing authorization so our resolved key (capitalized) is the only one.
+  const { authorization: _drop, ...rest } = real
+  void _drop
   return {
-    'Content-Type': 'application/json',
-    'User-Agent': OPENCODE_UA,
+    ...rest,
     Authorization: `Bearer ${resolveApiKey()}`,
-    'x-opencode-session': currentSession(),
-    'x-opencode-request': newRequestId(),
-    'x-opencode-client': OPENCODE_CLIENT,
-    'x-opencode-project': OPENCODE_PROJECT,
   }
 }
 
@@ -68,6 +73,8 @@ export async function* relayChatCompletions(opts) {
   } = opts
 
   const clientToolNames = callerToolNames(tools)
+  // Await the real opencode fingerprint once (cached/promised inside config.js).
+  const fpHeaders = await getFingerprintHeaders().catch(() => null)
   const baseBody = buildRequestBody({
     model, messages, system, tools,
     maxTokens: maxTokens || DEFAULT_MAX_TOKENS,
@@ -96,7 +103,7 @@ export async function* relayChatCompletions(opts) {
       const body = { ...baseBody, messages: wireMessages }
       response = await fetch(`${getOpencodeBase()}/chat/completions`, {
         method: 'POST',
-        headers: fingerprintHeaders(),
+        headers: fingerprintHeaders(fpHeaders),
         body: JSON.stringify(body),
         signal: controller.signal,
       })
@@ -130,13 +137,13 @@ export async function* relayChatCompletions(opts) {
     // (so the agent executes it itself). The agent never receives a tool name it
     // cannot run; the proxy never executes anything.
     if (!stream) {
-      const finalCompletion = await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames)
+      const finalCompletion = await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames, fpHeaders)
       yield finalCompletion
       return
     }
 
     if (ctype.includes('event-stream')) {
-      const finalCompletion = await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames)
+      const finalCompletion = await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames, fpHeaders)
       if (finalCompletion) yield* completionToChunks(finalCompletion)
       return
     }
@@ -164,7 +171,7 @@ export async function* relayChatCompletions(opts) {
  * textual note and re-queries upstream (a pure relay — no shell/filesystem
  * execution) until the model yields either real agent work or a final answer.
  */
-async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, clientToolNames) {
+async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, clientToolNames, fpHeaders) {
   const { model, maxTokens, temperature, topP, timeoutMs } = opts
   let wire = [...wireMessages]
   let response = firstResponse
@@ -212,7 +219,7 @@ async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, cl
       const assistantMsg = { ...msg, content: msg.content || null }
       wire = [...wire, assistantMsg, ...noteResults]
       response = await fetch(`${getOpencodeBase()}/chat/completions`, {
-        method: 'POST', headers: fingerprintHeaders(),
+        method: 'POST', headers: fingerprintHeaders(fpHeaders),
         body: JSON.stringify(buildWireBody({
           model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP,
         })),
