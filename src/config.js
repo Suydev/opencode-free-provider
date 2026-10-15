@@ -5,7 +5,7 @@ export const LITERAL_KEY = 'public'
 // Lazy getter so env overrides (e.g. OPENCODE_BASE_OVERRIDE for tests) take effect
 // even when config.js is already module-cached.
 export const getOpencodeBase = () =>
-  process.env.OPENCODE_BASE_OVERRIDE || 'https://opencode.ai/zen/v1'
+  process.env.OPENCODE_BASE_OVERRIDE || 'https://opencode.ai/inference/v1'
 
 // --- Client fingerprint ----------------------------------------------------
 // The free-tier gateway validates the User-Agent and the x-opencode-session id.
