@@ -13,6 +13,7 @@ let upstreamPort
 let firstTurnCalls = [] // [{ name, args }]
 let requestCount = 0
 let lastWireBody = null
+let destroyFirstN = 0 // simulate N connection resets (fetch failed) before succeeding
 
 function sse(res, obj) {
   res.write('data: ' + JSON.stringify(obj) + '\n\n')
@@ -47,6 +48,12 @@ before(async () => {
       req.on('data', (c) => (body += c))
       req.on('end', () => {
         requestCount++
+        if (destroyFirstN > 0) {
+          // Simulate a connection-level failure (ECONNRESET / "fetch failed").
+          destroyFirstN--
+          res.socket.destroy()
+          return
+        }
         const parsed = JSON.parse(body || '{}')
         lastWireBody = parsed
         const hasToolResult = (parsed.messages || []).some((m) => m.role === 'tool')
@@ -179,4 +186,45 @@ test('caller with no stand-in tool: glob becomes a textual note, not a tool the 
   assert.equal(requestCount, 2)
   const toolMsg = (lastWireBody.messages || []).find((m) => m.role === 'tool')
   assert.ok(toolMsg && /not available/.test(toolMsg.content), 'model gets a textual note for the missing tool')
+})
+
+test('retries and succeeds when the upstream connection is reset (fetch failed)', async () => {
+  // First upstream connection is reset mid-flight (ECONNRESET -> "fetch failed").
+  // The proxy must retry the whole turn and succeed on a later attempt.
+  firstTurnCalls = [{ id: 'call_0', name: 'glob', args: { pattern: '*.md' } }]
+  destroyFirstN = 1
+  requestCount = 0
+  const out = await collect({
+    model: 'big-pickle',
+    messages: [{ role: 'user', content: 'scan' }],
+    tools: callerTools(['bash', 'grep', 'read']),
+    stream: false,
+  })
+  assert.equal(out.length, 1)
+  assert.deepEqual(toolCallNames(out[0]), ['bash'], 'retried turn still translates glob to bash')
+  assert.equal(requestCount, 2, 'first attempt reset, second attempt succeeded')
+  destroyFirstN = 0
+})
+
+test('surfaces the underlying cause in the error message when all attempts fail', async () => {
+  firstTurnCalls = [{ id: 'call_0', name: 'glob', args: { pattern: '*.md' } }]
+  destroyFirstN = 100 // reset every attempt (max 3) so the relay fails outright
+  requestCount = 0
+  let caught = null
+  try {
+    await collect({
+      model: 'big-pickle',
+      messages: [{ role: 'user', content: 'scan' }],
+      tools: callerTools(['bash', 'grep', 'read']),
+      stream: false,
+    })
+  } catch (err) {
+    caught = err
+  }
+  destroyFirstN = 0
+  assert.ok(caught, 'relay surfaces an error when every attempt fails')
+  // The message must include a real cause (not a bare "fetch failed").
+  assert.match(caught.message, /fetch failed|socket|reset|ECONNRESET|stream/i,
+    `error message should carry a diagnosable cause, got: ${caught.message}`)
+  assert.ok(requestCount >= 2, `expected multiple retry attempts, got ${requestCount}`)
 })

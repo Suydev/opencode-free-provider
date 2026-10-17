@@ -3,9 +3,9 @@ import {
   isFingerprintTool, getFingerprintHeaders, peekFingerprintHeaders,
 } from './config.js'
 import {
-  buildRequestBody, buildWireBody, parseSse, translateStream,
+  buildRequestBody, buildWireBody, parseSse,
   callerToolNames, translateFingerprintCall, encodeTranslatedId,
-  normalizeToolArguments,
+  normalizeToolArguments, shapeCompletion,
 } from './conversions.js'
 
 function resolveApiKey() {
@@ -20,6 +20,58 @@ function abortedError() {
   const e = new Error('OpenCode Zen request aborted by caller')
   e.code = 'ABORTED'
   return e
+}
+
+// ---------------------------------------------------------------------------
+// Transport-failure classification + retry policy
+// ---------------------------------------------------------------------------
+// Node's global fetch surfaces network-level failures as TypeError("fetch
+// failed") with the real cause on err.cause (e.g. { code: 'ECONNRESET' }). The
+// upstream free tier is flaky: it resets connections mid-stream, and long
+// reasoning turns can exceed the per-request timeout (AbortError). We classify
+// those as retryable and enrich the error message with the underlying cause so
+// "fetch failed" becomes actionable (ECONNRESET / ETIMEDOUT / ...).
+const RETRYABLE_CAUSE_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+  'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE',
+  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT', 'UND_ERR_STREAM_TIMEOUT', 'UND_ERR_ABORTED', 'UND_ERR_DESTROYED',
+])
+
+function isRetryableUpstreamError(err) {
+  if (!err) return false
+  if (err.retryable === true) return true
+  if (err.code === 'RATE_LIMITED' || err.code === 'TRANSPORT') return true
+  if (err.name === 'AbortError') return true // our per-request timeout fired
+  const cause = err.cause
+  const causeCode = cause?.code || err.code
+  if (causeCode && RETRYABLE_CAUSE_CODES.has(causeCode)) return true
+  return /fetch failed|socket hang up|reset by peer/i.test(String(err.message || ''))
+}
+
+// Enrich a transport error with its real cause / a timeout marker so the
+// operator sees ECONNRESET/ETIMEDOUT/... instead of a bare "fetch failed".
+function enrichTransportError(err, phase, timeoutMs) {
+  if (!err) return new Error(`OpenCode Zen ${phase} failed`)
+  if (err.name === 'AbortError') {
+    err.message = `OpenCode Zen ${phase} timed out after ${timeoutMs || 60000}ms`
+    err.retryable = true
+    return err
+  }
+  const cause = err.cause
+  const causeInfo = cause ? (cause.code || cause.message) : null
+  if (causeInfo && !String(err.message).includes(String(causeInfo))) {
+    err.message = `${err.message} (${causeInfo})`
+  }
+  if (!err.code) err.retryable = true
+  return err
+}
+
+// Exponential backoff with jitter: ~500ms, 1s, 2s ... capped at 8s.
+function backoffMs(attempt) {
+  const base = 500 * 2 ** attempt
+  const jitter = Math.random() * base * 0.5
+  return Math.min(Math.round(base + jitter), 8000)
 }
 
 // Fingerprint headers the upstream free-tier gateway requires on every request.
@@ -85,20 +137,19 @@ export async function* relayChatCompletions(opts) {
   let wireMessages = baseBody.messages
   const wireTools = baseBody.tools
 
-  let lastError = null
-  const attempts = Math.max(1, MAX_REQUEST_ATTEMPTS)
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  // One complete upstream round-trip: fetch + consume the SSE (via
+  // runTranslateLoop) + translate tool calls. Connection-level failures
+  // (fetch failed / reset / timeout) and retryable HTTP statuses are thrown and
+  // retried by the loop below. Nothing is emitted to the agent until a turn
+  // fully succeeds, so retrying never duplicates already-delivered content.
+  async function performTurn() {
     if (signal?.aborted) throw abortedError()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs || 60000)
+    const onAbort = () => controller.abort()
+    if (signal) signal.addEventListener('abort', onAbort)
     let response
-    let controller
-    let timer
-    let onAbort
     try {
-      controller = new AbortController()
-      timer = setTimeout(() => controller.abort(), timeoutMs || 60000)
-      onAbort = () => controller.abort()
-      if (signal) signal.addEventListener('abort', onAbort)
-
       const body = { ...baseBody, messages: wireMessages }
       response = await fetch(`${getOpencodeBase()}/chat/completions`, {
         method: 'POST',
@@ -107,50 +158,62 @@ export async function* relayChatCompletions(opts) {
         signal: controller.signal,
       })
     } catch (err) {
-      if (signal?.aborted) throw abortedError()
-      lastError = err
-      if (attempt < attempts - 1) { await sleep(400 * (attempt + 1)); continue }
-      throw err
+      throw enrichTransportError(err, 'fetch', timeoutMs)
     } finally {
       clearTimeout(timer)
-      if (signal && onAbort) signal.removeEventListener('abort', onAbort)
+      if (signal) signal.removeEventListener('abort', onAbort)
     }
 
     if (!response.ok) {
       const raw = await response.text().catch(() => '')
-      const code = response.status === 429 ? 'RATE_LIMITED' : response.status >= 500 ? 'TRANSPORT' : 'PROVIDER_ERROR'
-      lastError = new Error(`OpenCode Zen HTTP ${response.status}: ${raw.slice(0, 300)}`)
-      lastError.code = code
-      lastError.status = response.status
-      // 429 / 5xx are retried; 4xx (besides 429) are surfaced immediately.
-      if (code !== 'RATE_LIMITED' && code !== 'TRANSPORT') throw lastError
-      if (attempt < attempts - 1) { await sleep(400 * (attempt + 1)); continue }
-      throw lastError
+      const status = response.status
+      const code = status === 429 ? 'RATE_LIMITED' : status >= 500 ? 'TRANSPORT' : 'PROVIDER_ERROR'
+      const e = new Error(`OpenCode Zen HTTP ${status}: ${raw.slice(0, 300)}`)
+      e.code = code
+      e.status = status
+      throw e
     }
 
     const ctype = response.headers.get('content-type') || ''
-    const estimateInput = () => JSON.stringify(wireMessages)
+    try {
+      // Fully consume the upstream stream (this is where a mid-stream connection
+      // drop surfaces) and translate fingerprint tool calls for the agent.
+      if (ctype.includes('event-stream')) {
+        return await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames, fpHeaders)
+      }
+      // Unexpected non-stream JSON response for a streaming request.
+      const payload = await response.json().catch(() => null)
+      if (!payload) throw new Error('OpenCode Zen returned an unexpected (non-SSE) completion body')
+      return shapeCompletion(payload, model)
+    } catch (err) {
+      throw enrichTransportError(err, 'stream', timeoutMs)
+    }
+  }
 
-    // Aggregate the upstream SSE into a single completion, rewriting any
-    // fingerprint tool_call the agent cannot run into an agent-supported tool
-    // (so the agent executes it itself). The agent never receives a tool name it
-    // cannot run; the proxy never executes anything.
-    if (!stream) {
-      const finalCompletion = await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames, fpHeaders)
-      yield finalCompletion
-      return
+  // Retry loop over the FULL turn. The free tier is flaky: connections get
+  // reset mid-stream and long turns can exceed the per-request timeout. We
+  // retry connection-level failures and 429/5xx with exponential backoff +
+  // jitter, enriching errors with the real cause (ECONNRESET, ETIMEDOUT, ...).
+  // Non-retryable 4xx and client aborts surface immediately.
+  const attempts = Math.max(1, MAX_REQUEST_ATTEMPTS)
+  let lastError = null
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let completion
+    try {
+      completion = await performTurn()
+    } catch (err) {
+      if (signal?.aborted) throw abortedError()
+      lastError = err
+      if (!isRetryableUpstreamError(err)) throw err
+      if (attempt >= attempts - 1) break
+      const waitMs = backoffMs(attempt)
+      console.warn(`[opencode-free-provider] upstream attempt ${attempt + 1}/${attempts} failed: ${err.message}; retrying in ${waitMs}ms`)
+      await sleep(waitMs)
+      continue
     }
 
-    if (ctype.includes('event-stream')) {
-      const finalCompletion = await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames, fpHeaders)
-      if (finalCompletion) yield* completionToChunks(finalCompletion)
-      return
-    }
-
-    // Unexpected non-stream upstream response for a streaming request: try JSON.
-    const payload = await response.json().catch(() => null)
-    if (!payload) throw new Error('OpenCode Zen returned an unexpected (non-SSE) completion body')
-    yield* translateStream(aggregateToChunks(payload), estimateInput)
+    if (!stream) { yield completion; return }
+    if (completion) yield* completionToChunks(completion)
     return
   }
   throw lastError || new Error('OpenCode Zen request failed')
