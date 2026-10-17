@@ -217,13 +217,23 @@ async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, cl
       // stops or emits real (agent-executable) tool calls on the next turn.
       const assistantMsg = { ...msg, content: msg.content || null }
       wire = [...wire, assistantMsg, ...noteResults]
-      response = await fetch(`${getOpencodeBase()}/chat/completions`, {
-        method: 'POST', headers: fingerprintHeaders(fpHeaders),
-        body: JSON.stringify(buildWireBody({
-          model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP,
-        })),
-        signal: AbortSignal.timeout(timeoutMs || 60000),
-      })
+      // Use a guarded AbortController (not a bare AbortSignal.timeout) so that a
+      // truncated stream here is caught and surfaces as a real error instead of
+      // being silently aggregated into a completion with a missing finish_reason
+      // — which is what later triggers "Stream ended without finish_reason".
+      const noteController = new AbortController()
+      const noteTimer = setTimeout(() => noteController.abort(), timeoutMs || 60000)
+      try {
+        response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+          method: 'POST', headers: fingerprintHeaders(fpHeaders),
+          body: JSON.stringify(buildWireBody({
+            model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP,
+          })),
+          signal: noteController.signal,
+        })
+      } finally {
+        clearTimeout(noteTimer)
+      }
       continue
     }
 
@@ -271,7 +281,17 @@ async function* completionToChunks(completion) {
   // 4) terminal chunk: carries the finish_reason (and usage). This MUST contain
   //    a choice with a non-null finish_reason, otherwise OpenAI-compatible
   //    clients abort with "Stream ended without finish_reason".
-  const finish = completion.choices?.[0]?.finish_reason || (msg.tool_calls?.length ? 'tool_calls' : 'stop')
+  //
+  //    IMPORTANT: coerce to a non-null sentinel. The upstream free tier can drop
+  //    the finish_reason (stream truncated by a network glitch or the per-request
+  //    AbortSignal.timeout firing in runTranslateLoop's note sub-loop), leaving
+  //    completion.choices[0].finish_reason === null/undefined. Passing that null
+  //    through is exactly what makes the client throw "Stream ended without
+  //    finish_reason". Always fall back to a concrete reason here.
+  const rawFinish = completion.choices?.[0]?.finish_reason
+  const finish = (rawFinish && typeof rawFinish === 'string' && rawFinish.length > 0)
+    ? rawFinish
+    : (msg.tool_calls?.length ? 'tool_calls' : 'stop')
   yield makeChunk(id, created, modelName, [{ delta: {}, finish_reason: finish }], finish, completion.usage)
 }
 

@@ -14,6 +14,7 @@ import {
   encodeTranslatedId,
   decodeTranslatedId,
   normalizeToolArguments,
+  sanitizeWireMessages,
 } from '../src/conversions.js'
 import { isFingerprintTool } from '../src/config.js'
 import { splitModelId, findModel, isValidModel, listModelsPayload } from '../src/models.js'
@@ -269,6 +270,81 @@ test('normalizeToolArguments falls back to {} for non-object JSON', function () 
 
 test('normalizeToolArguments stringifies object args', function () {
   assert.equal(normalizeToolArguments({ command: 'ls' }), '{"command":"ls"}')
+})
+
+test('sanitizeWireMessages drops assistant tool_calls missing a function name', function () {
+  const wire = [
+    { role: 'assistant', content: 'ok', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'bash', arguments: '{"command":"ls"}' } }] },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c2', type: 'function', function: { arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c2', content: 'orphan' },
+  ]
+  const out = sanitizeWireMessages(wire)
+  // c1 kept, c2 (no name) dropped
+  assert.equal(out.length, 2)
+  assert.equal(out[0].role, 'assistant')
+  assert.equal(out[0].tool_calls.length, 1)
+  assert.equal(out[0].tool_calls[0].id, 'c1')
+  // The assistant message that only had the bad call is kept (without tool_calls)
+  assert.equal(out[1].role, 'assistant')
+  assert.equal(out[1].tool_calls, undefined)
+})
+
+test('sanitizeWireMessages drops orphan tool results whose call was removed', function () {
+  const wire = [
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'bash', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'kept' },
+    { role: 'tool', tool_call_id: 'missing', content: 'dropped' },
+  ]
+  const out = sanitizeWireMessages(wire)
+  assert.equal(out.length, 2)
+  assert.equal(out[0].role, 'assistant')
+  assert.equal(out[1].role, 'tool')
+  assert.equal(out[1].content, 'kept')
+})
+
+test('sanitizeWireMessages keeps valid names and passes through non-tool messages', function () {
+  const wire = [
+    { role: 'system', content: 's' },
+    { role: 'user', content: 'u' },
+    { role: 'assistant', content: 'a', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'glob', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'r' },
+  ]
+  const out = sanitizeWireMessages(wire)
+  assert.equal(out.length, 4)
+  assert.equal(out[2].tool_calls[0].function.name, 'glob')
+  assert.equal(out[3].content, 'r')
+})
+
+test('translateStream emits a non-null finish_reason even when upstream drops it', async function () {
+  // Simulate an upstream stream that ends with NO finish_reason chunk
+  // (truncated by a network glitch / timeout). The proxy must still emit a
+  // terminal chunk with a concrete finish_reason, otherwise the caller throws
+  // "Stream ended without finish_reason".
+  async function* src() {
+    yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'big-pickle', choices: [{ index: 0, delta: { content: 'Hi' } }] }
+    // no finish_reason chunk at all
+  }
+  const out = []
+  for await (const c of translateStream(src(), () => 'estimate')) out.push(c)
+  const last = out[out.length - 1]
+  assert.equal(last.choices[0].finish_reason, 'stop', 'terminal chunk must carry a non-null finish_reason')
+})
+
+test('translateStream passes through a real upstream finish_reason', async function () {
+  async function* src() {
+    yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'big-pickle', choices: [{ index: 0, delta: { content: 'Hi' } }] }
+    yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'big-pickle', choices: [{ index: 0, delta: {}, finish_reason: 'length' }] }
+  }
+  const out = []
+  for await (const c of translateStream(src(), () => 'estimate')) out.push(c)
+  const last = out[out.length - 1]
+  assert.equal(last.choices[0].finish_reason, 'length')
+})
+
+test('sanitizeWireMessages handles empty/null/undefined input', function () {
+  assert.deepEqual(sanitizeWireMessages(undefined), [])
+  assert.deepEqual(sanitizeWireMessages(null), [])
+  assert.deepEqual(sanitizeWireMessages([]), [])
 })
 
 test('serializeMessages normalizes malformed tool-call arguments to {}', function () {

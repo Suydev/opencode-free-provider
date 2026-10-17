@@ -348,11 +348,16 @@ export async function* translateStream(rawChunks, estimateInput) {
       },
     }
   }
-  if (finishReason) {
-    yield {
-      id: undefined, object: 'chat.completion.chunk', created: 0, model: undefined,
-      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-    }
+  // Always emit a terminal chunk carrying a NON-NULL finish_reason. If the
+  // upstream dropped it (truncated stream), the caller would otherwise throw
+  // "Stream ended without finish_reason". Fall back to a concrete reason.
+  const rawFinish = finishReason
+  const finish = (rawFinish && typeof rawFinish === 'string' && rawFinish.length > 0)
+    ? rawFinish
+    : (toolCalls.size ? 'tool_calls' : 'stop')
+  yield {
+    id: undefined, object: 'chat.completion.chunk', created: 0, model: undefined,
+    choices: [{ index: 0, delta: {}, finish_reason: finish }],
   }
   void nextIndex
 }
@@ -380,9 +385,14 @@ export function buildWireBody({ model, wireMessages, wireTools, maxTokens, tempe
 }
 
 function finalizeBody({ model, wireMessages, wireTools, maxTokens, temperature, topP }) {
+  // Drop malformed assistant tool_calls (missing function.name) and the orphan
+  // tool results that reference them, so the upstream request stays valid. See
+  // sanitizeWireMessages for the full rationale (this is the single chokepoint
+  // shared by both the initial request and every re-sent follow-up turn).
+  const safeMessages = sanitizeWireMessages(wireMessages)
   return {
     model,
-    messages: wireMessages,
+    messages: safeMessages,
     stream: true,
     stream_options: { include_usage: true },
     max_tokens: maxTokens,
@@ -391,6 +401,66 @@ function finalizeBody({ model, wireMessages, wireTools, maxTokens, temperature, 
     tools: wireTools,
     tool_choice: 'auto',
   }
+}
+
+function hasFunctionName(tc) {
+  const n = tc?.function?.name
+  return typeof n === 'string' && n.length > 0
+}
+
+// ---------------------------------------------------------------------------
+// Wire-message sanitization (upstream contract enforcement)
+// ---------------------------------------------------------------------------
+// OpenCode Zen REJECTS a request with HTTP 400 "messages[N].tool_calls[M] is
+// missing a function name" if any assistant message carries a tool_call whose
+// function.name is absent or empty. This happens when:
+//   - an agent's history block (pi-agent `tool-call` content block) omits `name`
+//     (JSON.stringify then drops the `name` key entirely), or
+//   - the upstream tool-call stream was truncated (network glitch) so a call
+//     arrived with an id + arguments but no name, or
+//   - the model emitted a genuinely nameless tool call.
+// Because the whole conversation is re-sent every turn, a single bad tool call
+// deep in history kills the entire request. We sanitize at the one place every
+// upstream body passes through (finalizeBody):
+//   1) collect the set of valid tool_call ids (those with a name),
+//   2) drop assistant tool_calls that lack a name (emit the message as a plain
+//      assistant message if that empties its tool_calls), and
+//   3) drop `tool` result messages whose tool_call_id no longer references a
+//      kept tool_call (orphan results would otherwise also fail validation).
+// This is strictly safer than forwarding a malformed call and getting a 400.
+export function sanitizeWireMessages(messages) {
+  const validIds = new Set()
+  for (const m of messages || []) {
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (hasFunctionName(tc)) validIds.add(tc.id)
+      }
+    }
+  }
+  const out = []
+  for (const m of messages || []) {
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      const tcs = m.tool_calls.filter(hasFunctionName)
+      if (tcs.length === 0) {
+        // No usable tool call: emit the assistant message without an empty
+        // tool_calls array so the model still sees any text/reasoning.
+        const { tool_calls: _drop, ...rest } = m
+        void _drop
+        out.push(rest)
+      } else {
+        out.push({ ...m, tool_calls: tcs })
+      }
+      continue
+    }
+    if (m?.role === 'tool' && m.tool_call_id != null) {
+      // Drop orphan tool results (their tool_call was removed / never had a name).
+      if (!validIds.has(m.tool_call_id)) continue
+      out.push(m)
+      continue
+    }
+    out.push(m)
+  }
+  return out
 }
 
 // Combine any caller-supplied tools with the mandatory fingerprint tools.
