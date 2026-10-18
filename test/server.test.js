@@ -170,3 +170,26 @@ test('Health endpoint', async () => {
   const res = await fetchProxy('/')
   assert.equal(res.status, 200)
 })
+
+test('streaming proxy returns proper HTTP error when upstream fails before streaming', async () => {
+  failWith = { status: 400, error: { message: 'bad request' } }
+  try {
+    const res = await fetchProxy('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: `${PROVIDER}/big-pickle`, messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    })
+    // The proxy must NOT start an SSE stream and then truncate it; it should
+    // return a proper HTTP error so the client never sees a stream without a
+    // finish_reason ("Stream ended without finish_reason").
+    assert.equal(res.status, 400, 'returns proper HTTP status, not a broken stream')
+    assert.ok(!/text\/event-stream/i.test(res.headers.get('content-type') || ''),
+      'must not return text/event-stream when returning an HTTP error')
+    const ct = res.headers.get('content-type') || ''
+    assert.ok(/application\/json/i.test(ct), 'error is returned as JSON')
+    const json = await res.json()
+    assert.equal(json.error.code, 'PROVIDER_ERROR')
+  } finally {
+    failWith = null
+  }
+})

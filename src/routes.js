@@ -110,15 +110,22 @@ export async function handleChatCompletions(req, res) {
 
   try {
     if (stream) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'X-Accel-Buffering': 'no',
-      })
-      const writeChunk = (obj) => {
-        res.write(`data: ${JSON.stringify(obj)}\n\n`)
+      // Delay the SSE headers until the first chunk is ready. The relay buffers
+      // the whole upstream turn; if it fails before producing anything we can
+      // still return a proper HTTP error (the catch block below) instead of
+      // committing to a stream that would end with no finish_reason — which is
+      // what makes OpenAI-compatible clients throw "Stream ended without
+      // finish_reason".
+      let started = false
+      const startStream = () => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+          'X-Accel-Buffering': 'no',
+        })
+        started = true
       }
       for await (const chunk of relayChatCompletions({
         model,
@@ -132,8 +139,10 @@ export async function handleChatCompletions(req, res) {
         signal: clientAbort.signal,
         timeoutMs,
       })) {
-        writeChunk(chunk)
+        if (!started) startStream()
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`)
       }
+      if (!started) startStream()
       res.write('data: [DONE]\n\n')
       res.end()
     } else {
@@ -167,9 +176,13 @@ export async function handleChatCompletions(req, res) {
     if (!res.headersSent) {
       return sendJson(res, status, openaiError(status, message, 'upstream_error', err.code).body)
     }
-    // streaming already started — send a final error event
+    // Streaming already started (headers sent) — we cannot send an HTTP error.
+    // Emit a terminal finish_reason chunk so the client completes cleanly (never
+    // "Stream ended without finish_reason"), then surface the error as a final
+    // event for clients that parse it.
     try {
       res.write(`data: ${JSON.stringify({ error: { message, type: 'upstream_error', code: err.code } })}\n\n`)
+      res.write(`data: ${JSON.stringify({ id: 'chatcmpl-error', object: 'chat.completion.chunk', created: 0, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)
       res.write('data: [DONE]\n\n')
       res.end()
     } catch { /* ignore */ }
