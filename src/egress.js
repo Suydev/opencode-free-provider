@@ -348,10 +348,16 @@ export async function sweep({ size = SWEEP_CONCURRENCY, scrape = true } = {}) {
 // Fast rotation for the relay: when no verified proxy is available, inline-
 // probe up to `quick` untested candidates right now (bounded, ~8s each) so a
 // 429'd request rotates to fresh IPs immediately instead of waiting for the
-// next background sweep.
+// next background sweep. If the pool is fully exhausted (everything dead or
+// quota-dusted), scrape the web on demand first so there is something to probe.
 export async function ensureEgress({ quick = 3 } = {}) {
   const best = pickEgress()
   if (best) return best
+  if (!pool.some((e) => e.status === 'untested' && !isDustbinned(e.proxy))) {
+    const fresh = await scrapeSources().catch(() => [])
+    const added = addCandidates(fresh, 'scrape')
+    if (added) console.log(`[egress] fast-rotate: scraped +${added} fresh candidates on demand`)
+  }
   let tried = 0
   while (tried < quick) {
     const candidate = pool.find((e) => e.status === 'untested' && !isDustbinned(e.proxy))
