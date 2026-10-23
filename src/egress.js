@@ -58,6 +58,11 @@ const SCRAPE_SOURCES = [
     url: 'https://free-proxy-list.net/',
     parse: parseFreeProxyListHtml,
   },
+  {
+    name: 'proxyscrape',
+    url: 'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json',
+    parse: parseProxyscrapeJson,
+  },
 ]
 
 const GEO_UA =
@@ -172,6 +177,27 @@ function parseFreeProxyListHtml(html) {
   }
   out.sort((a, b) => a.ageSec - b.ageSec)
   return out.map((e) => e.proxy).slice(0, 150)
+}
+
+// proxyscrape v4 API (JSON): { proxies: [{ protocol, ip, port, alive, ssl, uptime, ... }] }
+// Keep live HTTP proxies that support the SSL/CONNECT tunnel (required to reach
+// the HTTPS upstream), ranked by uptime (the "fast + reliable" subset), capped.
+function parseProxyscrapeJson(text) {
+  let data
+  try {
+    data = JSON.parse(text)
+  } catch {
+    return []
+  }
+  const rows = Array.isArray(data?.proxies) ? data.proxies : []
+  return rows
+    .filter((p) => /http/i.test(p.protocol || ''))
+    .filter((p) => p.alive === true)
+    .filter((p) => p.ssl !== false)
+    .filter((p) => Number(p.uptime ?? 0) >= 80)
+    .sort((a, b) => Number(b.uptime) - Number(a.uptime))
+    .map((p) => `http://${p.ip}:${p.port}`)
+    .slice(0, 300)
 }
 
 export async function scrapeSources({ timeoutMs = 30_000 } = {}) {
