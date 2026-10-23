@@ -2,7 +2,10 @@ import { PROVIDER, sessionState, ensureModels, refreshModels, modelsCacheState }
 import { fingerprintState } from './fingerprint.js'
 import { listModelsPayload, isValidModel, findModel, splitModelId } from './models.js'
 import { relayChatCompletions } from './upstream.js'
-import { egressState } from './egress.js'
+import {
+  egressState, egressFullState, importProxies, toggleProxy, retestProxy, removeUserProxy,
+} from './egress.js'
+import { egressDashboardHtml } from './egress-dashboard.js'
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj)
@@ -55,6 +58,57 @@ export function handleSessionInfo(req, res) {
 // Local debug endpoint (never forwarded upstream). Egress pool / dustbin state.
 export function handleEgressInfo(req, res) {
   return sendJson(res, 200, { provider: PROVIDER, egress: egressState() })
+}
+
+// Full state for the dashboard: complete pool, user proxies, disabled set, dustbin.
+export function handleEgressFull(req, res) {
+  return sendJson(res, 200, { provider: PROVIDER, ...egressFullState() })
+}
+
+// Dashboard: single-file HTML control panel for the egress pool — IP toggles,
+// user-proxy add/import (paste or file), retest-now, and dustbin re-enable.
+export function handleEgressDashboard(req, res) {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+  res.end(egressDashboardHtml())
+}
+
+// POST /__egress/import — body is text (one proxy per line) or JSON {proxies:[...]}
+export async function handleEgressImport(req, res) {
+  let raw
+  try { raw = await readBody(req, 2 * 1024 * 1024) } catch {
+    return sendJson(res, 413, { error: { message: 'import too large' } })
+  }
+  const text = raw.toString('utf8').trim()
+  let input
+  try { input = JSON.parse(text) } catch { input = text }
+  const r = importProxies(input)
+  // immediately verify everything we just added (bounded by Promise.all, ~15s each)
+  const results = await Promise.all((r.addedEntries || []).slice(0, 20).map((e) => retestProxy(e.proxy)))
+  return sendJson(res, 200, { added: r.added, invalid: r.invalid, results: results.map((x) => ({ proxy: x.proxy, status: x.status, retryAfterSec: x.retryAfterSec || null, detail: x.detail || null })) })
+}
+
+// POST /__egress/toggle  { proxy }
+export async function handleEgressToggle(req, res) {
+  let parsed
+  try { parsed = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8')) } catch { parsed = {} }
+  const r = toggleProxy(parsed.proxy)
+  return sendJson(res, 200, { proxy: parsed.proxy || null, ...r })
+}
+
+// POST /__egress/retest { proxy }
+export async function handleEgressRetest(req, res) {
+  let parsed
+  try { parsed = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8')) } catch { parsed = {} }
+  const r = await retestProxy(parsed.proxy)
+  return sendJson(res, 200, { proxy: parsed.proxy || null, ...r })
+}
+
+// POST /__egress/remove-user { proxy }
+export async function handleEgressRemoveUser(req, res) {
+  let parsed
+  try { parsed = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8')) } catch { parsed = {} }
+  const r = removeUserProxy(parsed.proxy)
+  return sendJson(res, 200, { proxy: parsed.proxy || null, ...r })
 }
 
 export async function handleModel(req, res, id) {

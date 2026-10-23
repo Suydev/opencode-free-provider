@@ -24,7 +24,7 @@ import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
 import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
-import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo } from './src/routes.js'
+import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo, handleEgressDashboard, handleEgressImport, handleEgressToggle, handleEgressRetest, handleEgressRemoveUser, handleEgressFull } from './src/routes.js'
 import { startSweeper } from './src/egress.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
@@ -86,6 +86,36 @@ const server = http.createServer(async (req, res) => {
     // /__egress — local egress-pool status (pool / dustbin / last sweep).
     if (method === 'GET' && path === '/__egress') {
       return handleEgressInfo(req, res)
+    }
+
+    // /__egress/full — complete state for the dashboard.
+    if (method === 'GET' && path === '/__egress/full') {
+      return handleEgressFull(req, res)
+    }
+
+    // /__egress/dashboard — web control panel (IP toggles, add/import, retest).
+    if (method === 'GET' && path === '/__egress/dashboard') {
+      return handleEgressDashboard(req, res)
+    }
+
+    // /__egress/import — add proxies (paste body or {proxies:[...]}).
+    if (method === 'POST' && path === '/__egress/import') {
+      return await handleEgressImport(req, res)
+    }
+
+    // /__egress/toggle — { proxy } enable/disable rotation for one IP.
+    if (method === 'POST' && path === '/__egress/toggle') {
+      return await handleEgressToggle(req, res)
+    }
+
+    // /__egress/retest — { proxy } force a verification now.
+    if (method === 'POST' && path === '/__egress/retest') {
+      return await handleEgressRetest(req, res)
+    }
+
+    // /__egress/remove-user — { proxy } drop a user-added proxy.
+    if (method === 'POST' && path === '/__egress/remove-user') {
+      return await handleEgressRemoveUser(req, res)
     }
 
     return sendText(res, 404, 'Not Found', { 'Access-Control-Allow-Origin': '*' })

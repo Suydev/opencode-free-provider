@@ -26,6 +26,9 @@ import { getFingerprintHeaders } from './fingerprint.js'
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
 const POOL_FILE = process.env.EGRESS_POOL_FILE || path.join(ROOT, 'egress-pool.json')
 const DUSTBIN_FILE = process.env.EGRESS_DUSTBIN_FILE || path.join(ROOT, 'egress-dustbin.json')
+// Proxies the user explicitly added ("my" free-tier proxies). They are always
+// preferred in rotation and are never auto-culled by the sweeper.
+const USER_FILE = process.env.EGRESS_USER_FILE || path.join(ROOT, 'egress-user.json')
 
 // --- knobs -------------------------------------------------------------------
 export const SWEEP_CONCURRENCY = Number(process.env.EGRESS_SWEEP_CONCURRENCY) || 30
@@ -71,6 +74,8 @@ const GEO_UA =
 // --- state -------------------------------------------------------------------
 let pool = [] // { proxy, status:'ok'|'untested', ttfbMs, verifiedAt, ok, fail, source }
 let dustbin = [] // { proxy, reason:'dead'|'quota', detail, dustedAt, retestAt }
+let userProxies = [] // proxies the user added ("my" free-tier proxies)
+let disabled = new Set() // user-toggled-off proxies (excluded from rotation)
 let loaded = false
 let saving = false
 
@@ -110,6 +115,14 @@ function loadState() {
         .filter(Boolean)
     }
   } catch { /* start empty */ }
+  // user-added proxies + toggle state live in one file
+  try {
+    if (existsSync(USER_FILE)) {
+      const raw = JSON.parse(readFileSync(USER_FILE, 'utf8'))
+      userProxies = (Array.isArray(raw?.proxies) ? raw.proxies : []).filter((p) => /^https?:\/\//.test(p || ''))
+      disabled = new Set(Array.isArray(raw?.disabled) ? raw.disabled : [])
+    }
+  } catch { /* start empty */ }
 }
 
 function persist() {
@@ -118,6 +131,7 @@ function persist() {
   try {
     writeFileSync(POOL_FILE, JSON.stringify({ savedAt: Date.now(), entries: pool }, null, 1) + '\n')
     writeFileSync(DUSTBIN_FILE, JSON.stringify({ savedAt: Date.now(), entries: dustbin }, null, 1) + '\n')
+    writeFileSync(USER_FILE, JSON.stringify({ savedAt: Date.now(), proxies: userProxies, disabled: [...disabled] }, null, 1) + '\n')
   } catch (e) {
     console.error(`[egress] persist failed: ${e?.message}`)
   } finally {
@@ -303,6 +317,111 @@ function isDustbinned(proxyUrl) {
   return dustbin.some((d) => d.proxy === proxyUrl)
 }
 
+// --- user proxies ("my" free-tier proxies) + toggles + import ---------------
+// Normalize a user-supplied proxy reference into an http(s)://ip:port URL.
+// Accepts `ip:port`, `http://ip:port`, trailing junk; rejects anything else.
+export function normalizeProxyInput(input) {
+  let s = String(input || '').trim()
+  if (!s) return null
+  if (!/^https?:\/\//i.test(s)) s = `http://${s}`
+  try {
+    const u = new URL(s)
+    if (!/^(http:|https:)$/.test(u.protocol)) return null
+    if (!u.hostname || !u.port) return null
+    return `${u.protocol}//${u.hostname}:${u.port}`
+  } catch {
+    return null
+  }
+}
+
+// Import from either a plain string body (one proxy per line) or an array of
+// proxy strings. Returns { added, invalid } where added are the pool entries.
+export function importProxies(raw) {
+  const list = Array.isArray(raw) ? raw : String(raw ?? '').split(/\r?\n/)
+  const added = []
+  const invalid = []
+  for (const line of list) {
+    const s = String(line).trim()
+    if (!s || s.startsWith('#')) continue
+    const norm = normalizeProxyInput(s)
+    if (!norm) { invalid.push(s); continue }
+    if (userProxies.includes(norm)) continue
+    userProxies.push(norm)
+    const e = upsertPool(norm, 'user')
+    e.status = 'untested' // force a fresh verification on next sweep/relay
+    added.push(e)
+  }
+  persist()
+  return { added: added.length, addedEntries: added, invalid }
+}
+
+export function addUserProxy(input) {
+  const r = importProxies([input])
+  return r
+}
+
+// File import: read a local text file (one proxy per line; ip:port or
+// http://ip:port; # lines and blanks ignored) and import it. The dashboard's
+// file picker reads the file client-side and POSTs its contents to
+// /__egress/import — this helper is for the shell: `node -e "import('./src/egress.js').then(m=>m.importProxiesFromFile('/path/to/list.txt'))"`.
+export async function importProxiesFromFile(filePath) {
+  const { readFileSync: rfs } = await import('node:fs')
+  const text = rfs(filePath, 'utf8')
+  const r = importProxies(text)
+  console.log(`[egress] imported ${r.added} proxies from ${filePath} (${r.invalid.length} invalid lines)`)
+  return r
+}
+
+export function removeUserProxy(proxy) {
+  const p = normalizeProxyInput(proxy)
+  if (!p) return { removed: false }
+  userProxies = userProxies.filter((x) => x !== p)
+  disabled.delete(p)
+  persist()
+  return { removed: true }
+}
+
+// Toggle a proxy's participation in rotation. Disabled proxies are never picked
+// and never re-tested by sweeps; re-enabling marks it untested so it gets
+// verified on demand.
+export function toggleProxy(proxy) {
+  const p = normalizeProxyInput(proxy)
+  if (!p) return { enabled: null }
+  let enabled
+  if (disabled.has(p)) {
+    disabled.delete(p)
+    enabled = true
+    const e = findPool(p) || upsertPool(p, userProxies.includes(p) ? 'user' : 'scrape')
+    e.status = 'untested'
+    // give it a chance immediately if it was dustbinned
+    dustbin = dustbin.filter((d) => d.proxy !== p)
+  } else {
+    disabled.add(p)
+    enabled = false
+  }
+  persist()
+  return { enabled }
+}
+
+// Force a re-test of one proxy now (used by the dashboard "retest" button).
+export async function retestProxy(proxy) {
+  const p = normalizeProxyInput(proxy)
+  if (!p) return { proxy: p, status: 'invalid' }
+  const r = await testProxy(p)
+  if (r.status === 'ok') {
+    const e = upsertPool(r.proxy, userProxies.includes(p) ? 'user' : 'sweep')
+    e.status = 'ok'
+    e.ttfbMs = r.ttfbMs
+    e.verifiedAt = Date.now()
+    e.ok++
+    dustbin = dustbin.filter((d) => d.proxy !== p)
+  } else {
+    dustbinProxy(p, r.status, { detail: r.detail, retryAfterSec: r.retryAfterSec })
+  }
+  persist()
+  return r
+}
+
 function addCandidates(proxies, source) {
   let added = 0
   for (const p of proxies) {
@@ -425,14 +544,21 @@ export function startSweeper() {
 }
 
 // --- selection ----------------------------------------------------------------
-// Best usable proxy: verified-ok, lowest ttfb, not dustbinned. Returns null when
-// the pool is empty (caller falls back to the direct connection).
+// Best usable proxy: verified-ok, not disabled, not dustbinned. User-added
+// ("my") proxies are preferred over scraped ones; among the rest, lowest ttfb.
+// Returns null when nothing usable (caller falls back to the direct connection).
 export function pickEgress() {
   const now = Date.now()
   const usable = pool
     .filter((e) => e.status === 'ok')
     .filter((e) => !isDustbinned(e.proxy))
-    .sort((a, b) => (a.ttfbMs || 9e9) - (b.ttfbMs || 9e9))
+    .filter((e) => !disabled.has(e.proxy))
+    .sort((a, b) => {
+      const au = userProxies.includes(a.proxy) ? 0 : 1
+      const bu = userProxies.includes(b.proxy) ? 0 : 1
+      if (au !== bu) return au - bu // user proxies first
+      return (a.ttfbMs || 9e9) - (b.ttfbMs || 9e9)
+    })
   return usable[0]?.proxy || null
 }
 
@@ -472,6 +598,18 @@ export function egressState() {
       .sort((a, b) => (a.ttfbMs || 9e9) - (b.ttfbMs || 9e9))
       .slice(0, 5)
       .map((e) => ({ proxy: e.proxy, ttfbMs: e.ttfbMs, ok: e.ok, verifiedAt: e.verifiedAt })),
+  }
+}
+
+// Complete state for the dashboard: every pool entry, user proxies, disabled
+// set and the dustbin (capped for transport).
+export function egressFullState() {
+  return {
+    ...egressState(),
+    pool: pool.map((e) => ({ ...e, mine: userProxies.includes(e.proxy) })),
+    user: userProxies.map((p) => ({ proxy: p, disabled: disabled.has(p) })),
+    disabled: [...disabled],
+    dustbin: [...dustbin].sort((a, b) => a.retestAt - b.retestAt).slice(0, 500),
   }
 }
 

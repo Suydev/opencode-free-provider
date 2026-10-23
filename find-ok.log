@@ -1,0 +1,7 @@
+[egress] scrape geonode: 16 fast http proxies
+[egress] scrape monosans: 459 fast http proxies
+[egress] scrape free-proxy-list.net: 45 fast http proxies
+[egress] scrape proxyscrape: 30 fast http proxies
+[egress] sweep: tested 30 → ok 0, quota 5, dead 25
+[egress] sweep: tested 26 → ok 0, quota 2, dead 24
+GRIND DONE ok: 0 best: null untested: 0 dustQuota: 564 dustDead: 607
