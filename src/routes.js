@@ -3,7 +3,7 @@ import { fingerprintState } from './fingerprint.js'
 import { listModelsPayload, isValidModel, findModel, splitModelId } from './models.js'
 import { relayChatCompletions } from './upstream.js'
 import {
-  egressState, egressFullState, importProxies, toggleProxy, retestProxy, removeUserProxy,
+  egressState, egressFullState, importProxies, toggleProxy, retestProxy, removeUserProxy, setEgressOn,
 } from './egress.js'
 import { egressDashboardHtml } from './egress-dashboard.js'
 
@@ -109,6 +109,15 @@ export async function handleEgressRemoveUser(req, res) {
   try { parsed = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8')) } catch { parsed = {} }
   const r = removeUserProxy(parsed.proxy)
   return sendJson(res, 200, { proxy: parsed.proxy || null, ...r })
+}
+
+// POST /__egress/set { on: true|false } — master switch. on=false forces every
+// relay turn to the DIRECT connection (the egress pool is ignored entirely).
+export async function handleEgressSet(req, res) {
+  let parsed
+  try { parsed = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8')) } catch { parsed = {} }
+  const r = setEgressOn(parsed.on)
+  return sendJson(res, 200, { ...r, mode: r.egressOn ? 'pool-rotation' : 'direct-only' })
 }
 
 export async function handleModel(req, res, id) {

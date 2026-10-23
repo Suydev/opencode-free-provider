@@ -1,5 +1,8 @@
 {
- "savedAt": 1792774167273,
+ "savedAt": 1792776166271,
  "proxies": [],
- "disabled": []
+ "disabled": [
+  "http://1.2.3.4:9999"
+ ],
+ "egressOn": true
 }

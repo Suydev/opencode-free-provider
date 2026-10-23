@@ -58,6 +58,10 @@ export function egressDashboardHtml() {
   .due { color: var(--warn) }
   .spin { animation: spin 1s linear infinite; display: inline-block }
   @keyframes spin { to { transform: rotate(360deg) } }
+  label.master { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--dim); letter-spacing: .8px; cursor: pointer; user-select: none }
+  #masterBox { display: inline-block }
+  #modeLine b.pool { color: var(--ok) } #modeLine b.direct { color: var(--warn) }
+  body.direct #poolTable, body.direct #dustTable, body.direct #userTable { opacity: .4 }
 </style>
 </head>
 <body>
@@ -66,9 +70,19 @@ export function egressDashboardHtml() {
   <span class="pill" id="pill">…</span>
   <span class="pill" id="sweep"></span>
   <span style="flex:1"></span>
+  <label class="master">ROUTE
+    <span id="masterBox">
+      <input type="checkbox" id="master" class="sw" onchange="setMode(this.checked)">
+    </span>
+  </label>
   <button onclick="refresh()">↻ refresh</button>
 </header>
 <main>
+  <section style="margin-bottom:14px">
+    <h2>Connection mode</h2>
+    <div id="modeLine" style="font-size:13px">…</div>
+    <div class="hint">OFF = every request goes out <b>directly</b> from this machine (your own IP) and the whole pool is ignored. ON = route through the best verified egress IP; your own proxies ("mine") are preferred.</div>
+  </section>
   <div class="cards" id="cards"></div>
 
   <section>
@@ -111,6 +125,7 @@ async function refresh() {
   const j = await (await fetch('/__egress')).json();
   const e = j.egress;
   renderCards(e);
+  renderMode(e);
   // full state comes from /__egress + the table payloads below
   const state = await fetch('/__egress/full').then(r => r.ok ? r.json() : null);
   const pools = state?.pool || e.top || [];
@@ -118,6 +133,22 @@ async function refresh() {
   renderPool(pools, state?.disabled || []);
   renderDust(state?.dustbin || [], e.dustbin);
   document.title = \`egress · ok \${e.ok} · user \${(state?.user||[]).length}\`;
+}
+
+function renderMode(e) {
+  const on = e.egressOn !== false;
+  const cb = $('#master');
+  if (cb) cb.checked = on;
+  document.body.classList.toggle('direct', !on);
+  const ml = $('#modeLine');
+  if (ml) ml.innerHTML = on
+    ? 'Routing via egress pool → <b class="pool">PROXY</b> (best: ' + (e.best ? e.best : 'none verified yet') + ')'
+    : '<b class="direct">DIRECT ONLY</b> — the egress pool is OFF; every request uses this machine\'s own IP.';
+}
+
+async function setMode(on) {
+  await api('/__egress/set', { method: 'POST', body: JSON.stringify({ on }) });
+  refresh();
 }
 
 function renderCards(e) {

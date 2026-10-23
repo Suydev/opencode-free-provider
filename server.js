@@ -24,7 +24,7 @@ import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
 import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
-import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo, handleEgressDashboard, handleEgressImport, handleEgressToggle, handleEgressRetest, handleEgressRemoveUser, handleEgressFull } from './src/routes.js'
+import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo, handleEgressDashboard, handleEgressImport, handleEgressToggle, handleEgressRetest, handleEgressRemoveUser, handleEgressFull, handleEgressSet } from './src/routes.js'
 import { startSweeper } from './src/egress.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
@@ -116,6 +116,11 @@ const server = http.createServer(async (req, res) => {
     // /__egress/remove-user — { proxy } drop a user-added proxy.
     if (method === 'POST' && path === '/__egress/remove-user') {
       return await handleEgressRemoveUser(req, res)
+    }
+
+    // /__egress/set — { on } master switch (off = force direct connection).
+    if (method === 'POST' && path === '/__egress/set') {
+      return await handleEgressSet(req, res)
     }
 
     return sendText(res, 404, 'Not Found', { 'Access-Control-Allow-Origin': '*' })

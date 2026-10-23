@@ -76,6 +76,8 @@ let pool = [] // { proxy, status:'ok'|'untested', ttfbMs, verifiedAt, ok, fail, 
 let dustbin = [] // { proxy, reason:'dead'|'quota', detail, dustedAt, retestAt }
 let userProxies = [] // proxies the user added ("my" free-tier proxies)
 let disabled = new Set() // user-toggled-off proxies (excluded from rotation)
+// Master switch: false = force DIRECT connection (ignore the pool entirely).
+let egressOn = true
 let loaded = false
 let saving = false
 
@@ -121,6 +123,7 @@ function loadState() {
       const raw = JSON.parse(readFileSync(USER_FILE, 'utf8'))
       userProxies = (Array.isArray(raw?.proxies) ? raw.proxies : []).filter((p) => /^https?:\/\//.test(p || ''))
       disabled = new Set(Array.isArray(raw?.disabled) ? raw.disabled : [])
+      if (raw?.egressOn === false) egressOn = false
     }
   } catch { /* start empty */ }
 }
@@ -131,7 +134,7 @@ function persist() {
   try {
     writeFileSync(POOL_FILE, JSON.stringify({ savedAt: Date.now(), entries: pool }, null, 1) + '\n')
     writeFileSync(DUSTBIN_FILE, JSON.stringify({ savedAt: Date.now(), entries: dustbin }, null, 1) + '\n')
-    writeFileSync(USER_FILE, JSON.stringify({ savedAt: Date.now(), proxies: userProxies, disabled: [...disabled] }, null, 1) + '\n')
+    writeFileSync(USER_FILE, JSON.stringify({ savedAt: Date.now(), proxies: userProxies, disabled: [...disabled], egressOn }, null, 1) + '\n')
   } catch (e) {
     console.error(`[egress] persist failed: ${e?.message}`)
   } finally {
@@ -496,6 +499,7 @@ export async function sweep({ size = SWEEP_CONCURRENCY, scrape = true } = {}) {
 // next background sweep. If the pool is fully exhausted (everything dead or
 // quota-dusted), scrape the web on demand first so there is something to probe.
 export async function ensureEgress({ quick = 3 } = {}) {
+  if (!egressOn) return null // master switch forces direct
   const best = pickEgress()
   if (best) return best
   if (!pool.some((e) => e.status === 'untested' && !isDustbinned(e.proxy))) {
@@ -544,11 +548,24 @@ export function startSweeper() {
 }
 
 // --- selection ----------------------------------------------------------------
-// Best usable proxy: verified-ok, not disabled, not dustbinned. User-added
-// ("my") proxies are preferred over scraped ones; among the rest, lowest ttfb.
-// Returns null when nothing usable (caller falls back to the direct connection).
+// Master switch toggle (persisted). `on=false` forces DIRECT connection for
+// every relay turn — the pool is ignored entirely (pickEgress returns null).
+export function setEgressOn(on) {
+  egressOn = on !== false
+  persist()
+  return { egressOn }
+}
+
+export function egressOnState() {
+  return egressOn
+}
+
+// Best usable proxy: verified-ok, not disabled, not dustbinned, and the master
+// switch on. User-added ("my") proxies are preferred over scraped ones; among
+// the rest, lowest ttfb. Returns null when nothing usable (caller falls back
+// to the direct connection).
 export function pickEgress() {
-  const now = Date.now()
+  if (!egressOn) return null // master switch: force direct
   const usable = pool
     .filter((e) => e.status === 'ok')
     .filter((e) => !isDustbinned(e.proxy))
@@ -584,6 +601,7 @@ export function reportEgress(proxyUrl, outcome, { retryAfterSec } = {}) {
 
 export function egressState() {
   return {
+    egressOn,
     poolSize: pool.length,
     ok: pool.filter((e) => e.status === 'ok').length,
     untested: pool.filter((e) => e.status === 'untested').length,
