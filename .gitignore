@@ -8,3 +8,7 @@ server.log
 .oc-body.json
 .geonode.html
 .src-*
+find-ok.log
+*.log
+.restart.sh
+.find-ok.sh
