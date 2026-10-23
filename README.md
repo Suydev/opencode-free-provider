@@ -271,6 +271,11 @@ PI Agent example:
 - `GET /__session` — local fingerprint/session status (includes `fingerprint.source`: `generated` = computed in pure JS)
 - `GET /__models` — local model-registry cache status (`?refresh=1` forces a re-fetch)
 - `GET /__egress` — egress pool / dustbin / last-sweep status (see "Egress IP pool")
+- `GET /__egress/dashboard` — **web control panel** (IP toggles, add proxies, retest)
+- `POST /__egress/import` — add proxies: body is plain text (one per line) or JSON `{ "proxies": [...] }`; each is verified immediately
+- `POST /__egress/toggle` — `{ "proxy" }` enable/disable one IP in rotation (persisted)
+- `POST /__egress/retest` — `{ "proxy" }` force a verification now
+- `POST /__egress/remove-user` — `{ "proxy" }` drop a user-added proxy
 
 ## Models
 
