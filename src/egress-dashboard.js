@@ -12,11 +12,18 @@ export function egressDashboardHtml() {
 <title>opencode-free-provider · egress</title>
 <style>
   :root {
-    --bg: #0b0e14; --panel: #131826; --line: #232b3f; --text: #d7e0f0;
-    --dim: #8593ad; --ok: #3ddc84; --warn: #ffc857; --bad: #ff5d5d; --accent: #4d9fff;
+    --bg: #F2F2F7; --panel: #FFFFFF; --line: rgba(60,60,67,.15); --text: #000;
+    --dim: rgba(60,60,67,.6); --ok: #34C759; --warn: #FF9500; --bad: #FF3B30; --accent: #007AFF;
+    --radius: 12px; --pad: 16px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --panel: #1C1C1E; --line: rgba(84,84,88,.5); --text: #F5F5F7;
+      --dim: rgba(235,235,245,.6); --ok: #30D158; --warn: #FF9F0A; --bad: #FF453A; --accent: #0A84FF;
+    }
   }
   * { box-sizing: border-box }
-  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 ui-monospace, "SFMono-Regular", Menlo, monospace }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.47 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif; -webkit-font-smoothing: antialiased }
   header { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5 }
   header h1 { font-size: 15px; margin: 0; letter-spacing: .5px }
   .pill { padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); font-size: 12px; color: var(--dim) }
@@ -29,28 +36,36 @@ export function egressDashboardHtml() {
   .card.ok .n { color: var(--ok) } .card.warn .n { color: var(--warn) } .card.bad .n { color: var(--bad) }
   .best { grid-column: 1 / -1; font-size: 13px; color: var(--dim) }
   .best b { color: var(--ok) }
-  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px }
+  section { background: var(--panel); border: none; border-radius: var(--radius); padding: var(--pad); margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.06) }
+  @media (prefers-color-scheme: dark) { section { box-shadow: none } }
   section h2 { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin: 0 0 10px }
-  table { width: 100%; border-collapse: collapse; font-size: 13px }
-  td, th { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle }
-  th { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .6px }
+  table { width: 100%; border-collapse: collapse; font-size: 15px }
+  td, th { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; font-variant-numeric: tabular-nums }
+  th { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .6px }
   .tag { display: inline-block; min-width: 56px; text-align: center; padding: 1px 8px; border-radius: 6px; font-size: 11px; font-weight: 700 }
   .tag.ok { background: rgba(61,220,132,.15); color: var(--ok) }
   .tag.untested { background: rgba(133,147,173,.15); color: var(--dim) }
   .tag.quota { background: rgba(255,200,87,.15); color: var(--warn) }
   .tag.dead { background: rgba(255,93,93,.15); color: var(--bad) }
   .tag.user { background: rgba(77,159,255,.18); color: var(--accent) }
-  button { cursor: pointer; background: #1b2334; color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 4px 10px; font: inherit; font-size: 12px }
+  button { cursor: pointer; background: #E5E5EA; color: #000; border: none; border-radius: 10px; padding: 0 14px; min-height: 44px; font: inherit; font-size: 15px; font-weight: 600; transition: opacity .12s }
+  button:active { opacity: .6 }
+  @media (prefers-color-scheme: dark) { button { background: #2C2C2E; color: #F5F5F7 } }
   button:hover { background: #232d44 }
-  button.on { border-color: var(--ok); color: var(--ok) }
-  button.act { border-color: var(--accent); color: var(--accent) }
+  button.on { background: #1C7C3C; color: #fff }
+  button.act { background: var(--accent); color: #fff }
+  @media (prefers-color-scheme: dark) {
+    button.on { background: #30D158; color: #000 }
+    button.act { background: var(--accent); color: #fff }
+  }
   input[type=checkbox].sw { appearance: none; width: 34px; height: 19px; border-radius: 999px; background: #2a3450; position: relative; cursor: pointer; display: inline-block; margin: 0 }
   input[type=checkbox].sw::after { content: ""; position: absolute; width: 15px; height: 15px; border-radius: 50%; background: var(--dim); top: 2px; left: 3px; transition: all .15s }
   input[type=checkbox].sw:checked { background: rgba(61,220,132,.3) }
   input[type=checkbox].sw:checked::after { left: 16px; background: var(--ok) }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end }
   label.f { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); flex: 1 1 260px }
-  input[type=text], textarea { background: #0e1422; border: 1px solid var(--line); color: var(--text); border-radius: 7px; padding: 7px 10px; font: inherit; width: 100% }
+  input[type=text], textarea { background: #E5E5EA; border: none; color: var(--text); border-radius: 10px; padding: 10px 12px; font: inherit; width: 100% }
+  @media (prefers-color-scheme: dark) { input[type=text], textarea { background: #2C2C2E } }
   textarea { min-height: 70px; resize: vertical }
   .hint { color: var(--dim); font-size: 11px; margin-top: 6px }
   .msg { margin-top: 8px; font-size: 12px; color: var(--dim); min-height: 16px }
