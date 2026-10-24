@@ -158,7 +158,7 @@ function renderMode(e) {
   const ml = $('#modeLine');
   if (ml) ml.innerHTML = on
     ? 'Routing via egress pool → <b class="pool">PROXY</b> (best: ' + (e.best ? e.best : 'none verified yet') + ')'
-    : '<b class="direct">DIRECT ONLY</b> — the egress pool is OFF; every request uses this machine\'s own IP.';
+    : '<b class="direct">DIRECT ONLY</b> — the egress pool is OFF; every request leaves this machine on its own IP.';
 }
 
 async function setMode(on) {
