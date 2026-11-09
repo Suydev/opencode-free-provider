@@ -155,7 +155,7 @@ export function sessionState() {
 // Mimic the official opencode client UA. The gate rejects anything that is not
 // an `opencode/<version>` UA, and requires version >= 1.18 (older → 426).
 // Override with OPENCODE_UA if upstream raises the floor.
-export const OPENCODE_UA = process.env.OPENCODE_UA || 'opencode/latest/2.0.22/cli'
+export const OPENCODE_UA = process.env.OPENCODE_UA || 'opencode/latest/2.2.6/cli'
 export const OPENCODE_CLIENT = 'cli'
 export const OPENCODE_PROJECT = 'global'
 
