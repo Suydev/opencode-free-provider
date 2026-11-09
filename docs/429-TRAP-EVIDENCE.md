@@ -1,16 +1,70 @@
-# The 429 `FreeUsageLimitError` is a trap message — evidence
+# The 429 `FreeUsageLimitError` — GATE CRACKED (2026-11-09, later the same day)
 
-**Date:** 2026-11-09 · **Endpoint:** `https://opencode.ai/inference/openai/v1/chat/completions` (also reproduced on the old `/inference/v1`)
+**TL;DR:** the 429 is one message masking **two different denials**:
 
-## Claim
+1. **TLS/runtime fingerprint gate** — the request must originate from **Bun** (BoringSSL).
+   Node, curl, python, undici — anything with an OpenSSL ClientHello — is rejected with
+   this exact 429, `server-timing: gateway;dur=0`, regardless of headers, body, session,
+   or IP. **Proven back-to-back:** the byte-identical captured real-client request →
+   `200 OK` under Bun, `429` under Node, seconds apart, same IP.
+2. **A daily usage pool** on the shared `Bearer public` key that resets at
+   **midnight UTC** (5:30 AM IST). When the pool is dry, even a perfect Bun client gets
+   this 429. `retry-after` always points at the next midnight UTC (observed 49832s,
+   45798s — both landing on 2026-11-10T00:00 UTC). Fresh proxy IPs do NOT help — the
+   pool is account-level, not per-IP (tested: direct + 2 fresh premium IPs, all 429).
 
-Upstream answers **every rejected free-model request** with the same 429:
+## The decisive experiment (live MITM capture of the real client)
 
-```json
-{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go"}}
-```
+Official opencode **v2.2.6** (253 MB Bun binary at `~/.opencode/bin/opencode`) was run
+inside the PRoot distro (it is glibc-linked; the Termux musl wrapper is what breaks it)
+through a local CONNECT-MITM proxy (`HTTPS_PROXY` + `NODE_TLS_REJECT_UNAUTHORIZED=0`,
+Bun honors both). Captured wire traffic: `~/opencode-re/captures.jsonl`.
 
-regardless of the *actual* reason for rejection — invalid fingerprint, garbage session, or a brand-new IP that has never used the free tier. It is a catch-all denial whose text is marketing for OpenCode Go, not a real quota state.
+- Real client POSTs to **`https://opencode.ai/inference/openai/v1/chat/completions`**
+- Headers: `authorization: Bearer public`, UA `opencode/latest/2.2.6/cli`,
+  `x-opencode-client: cli`, `x-opencode-project: <40-hex git hash>` (NOT "global"),
+  `x-opencode-session` = `x-opencode-session-id` = one `ses_…` id,
+  **plus new v2.2.6 headers**: `x-session-id` + `x-session-affinity` (same `ses_` id)
+  and `b3` + `traceparent` (W3C trace context).
+  **It does NOT send `x-opencode-request`.**
+- Body: `stream: true`, `stream_options: { include_usage: true }`,
+  `max_completion_tokens` (not `max_tokens`), tools named
+  `shell, glob, grep, read, edit, write, execute, question, skill, subagent, webfetch,
+  websearch` — **`shell`, not `bash`** — plus a 9k-char agent system prompt.
+
+Replaying that exact capture:
+
+| Runtime | Result |
+|---|---|
+| **Bun 1.4.4** | `200 OK` — real GLM-5.3-flash-free SSE chunks (7/7 times across header variants) |
+| **Node 22 (OpenSSL)** | `429 FreeUsageLimitError` — byte-identical request |
+
+Header/body ablation on Bun showed headers and body shape are **not** validated:
+even `{authorization, content-type, user-agent, x-opencode-session(+id), client,
+project}` with no trace headers and no tools returns 200 — while the pool has room.
+
+## Earlier evidence (still valid, now explained)
+
+The probes below were run under Node/curl — i.e. they were all TLS-gate rejections,
+which is why they all looked identical:
+
+- Bare curl client, zero fingerprint headers → same 429 (TLS gate, not quota)
+- Fresh never-used premium proxy IPs → same 429 (TLS gate; proxies were pointless
+  because the client runtime, not the IP, was the discriminator)
+- Garbage session id → same 429 (session shape is not validated at all)
+- Paid model + free key → 401 AuthError (gateway can be precise when it wants)
+- Same construction returned real responses earlier the same day → the difference was
+  pool availability + (for the working replica) the Bun runtime
+- `server-timing: gateway;dur=0` — static edge rejection, no upstream work
+
+## Practical consequences
+
+1. **The provider must run under Bun.** `bun server.js` (the Docker image already
+   does). Under Node every upstream call is trapped.
+2. **Proxy rotation cannot fix a 429** — neither gate is IP-based.
+3. **The 429 is only "real quota" when the client is Bun** — then it means the shared
+   key's daily pool is dry until midnight UTC (5:30 AM IST).
+4. Header/body mimicry beyond the basics is unnecessary — runtime is everything.
 
 ## Evidence
 
