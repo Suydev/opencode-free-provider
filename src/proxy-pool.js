@@ -58,9 +58,31 @@ function maskProxy(proxy) {
   }
 }
 
+let _undici = null
+let _agent = null
+let _agentFor = null
+
+// Node's global fetch is backed by an internal, older undici copy that rejects
+// dispatchers from the standalone `undici` package (`invalid onRequestStart
+// method`). When proxying, use undici's own fetch so the agent and fetch come
+// from the same package. Cached across requests; ProxyAgent is reused per proxy.
+async function nodeProxiedFetch(proxy) {
+  if (!_undici) _undici = await import('undici')
+  if (!_agent || _agentFor !== proxy) {
+    _agent = new _undici.ProxyAgent(proxy)
+    _agentFor = proxy
+  }
+  return (url, options = {}) => _undici.fetch(url, { ...options, dispatcher: _agent })
+}
+
 export async function fetchWithProxy(url, options = {}) {
   const proxy = currentProxy()
   const opts = { ...options }
-  if (proxy && typeof Bun !== 'undefined') opts.proxy = proxy
-  return fetch(url, opts)
+  if (!proxy) return fetch(url, opts)
+  if (typeof Bun !== 'undefined') {
+    opts.proxy = proxy
+    return fetch(url, opts)
+  }
+  const proxiedFetch = await nodeProxiedFetch(proxy)
+  return proxiedFetch(url, opts)
 }
