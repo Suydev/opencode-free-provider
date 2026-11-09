@@ -120,10 +120,15 @@ export const ZEN_MODELS_TIMEOUT_MS = Number(process.env.ZEN_MODELS_TIMEOUT_MS) |
 export function normalizeModel(entry) {
   const id = typeof entry === 'string' ? entry : entry && entry.id
   if (!MODEL_ID_FILTER(id)) return null
+  // Upstream metadata carries the real limits at limit.context / limit.output
+  // (top-level context_window does not exist upstream — the default below is
+  // only a fallback for bare-id entries).
+  const limit = (entry && entry.limit) || {}
   return {
     id,
     name: (entry && entry.name) || id,
-    contextWindow: (entry && (entry.context_window || entry.contextWindow)) || DEFAULT_CONTEXT_WINDOW,
+    contextWindow: limit.context || (entry && (entry.context_window || entry.contextWindow)) || DEFAULT_CONTEXT_WINDOW,
+    maxOutput: limit.output || null,
     description: `OpenCode Zen 免费档 (${id})`,
   }
 }

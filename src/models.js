@@ -24,6 +24,7 @@ export function listModelsPayload() {
       // extra, non-standard but harmless hints for agents that read them
       description: m.description,
       context_window: m.contextWindow,
+      max_output_tokens: m.maxOutput || null,
     })),
   }
 }
